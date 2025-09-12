@@ -99,11 +99,11 @@ svc_auth_authenticate(struct svc_req *req, bool *no_dispatch)
 	req->rq_msg.RPCM_ack.ar_verf.oa_flavor = cred_flavor;
 	switch (cred_flavor) {
 #ifdef USE_TLS
-        case AUTH_TLS:
-            /* Validate AUTH_TLS probe */
-            rslt = _svcauth_tls(req);
-            goto out;
-#endif /* HAVE_TLS */
+	case AUTH_TLS:
+		/* Validate AUTH_TLS probe */
+		rslt = _svcauth_tls(req);
+		goto out;
+#endif /* USE_TLS */
 #ifdef _HAVE_GSSAPI
 	case RPCSEC_GSS:
 		rslt = _svcauth_gss(req, no_dispatch);

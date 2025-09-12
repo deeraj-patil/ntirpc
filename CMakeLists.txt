@@ -78,29 +78,29 @@ if (USE_GSS)
 endif (USE_GSS)
 
 option(USE_MONITORING "Enable monitoring stack" ON)
-option(USE_TLS "Enable TLS >>>>>>.. " OFF)
-option(USE_OPENSSL "Enable OPENSSL >>>>>." OFF)
-option(USE_GNUTLS "Enable GNUTLS >>>>>>>." OFF)
+option(USE_TLS "Enable TLS support" OFF)
+option(USE_OPENSSL "Use OpenSSL as TLS backend" OFF)
+option(USE_GNUTLS "Use GNUTLS as TLS backend" OFF)
 # Find TLS libraries based on configuration
 if(USE_TLS)
   set(TLS_COMPONENTS "")
 
   if(USE_OPENSSL)
     list(APPEND TLS_COMPONENTS "openssl")
+    set(USE_GNUTLS OFF)
   endif(USE_OPENSSL)
 
   if(USE_GNUTLS)
     list(APPEND TLS_COMPONENTS "gnutls")
+    set(USE_OPENSSL OFF)
   endif(USE_GNUTLS)
 
-  find_package(TLS REQUIRED ${TLS_COMPONENTS})
-
-  # Set appropriate compile definitions based on TLS backend
-  if(TLS_BACKEND STREQUAL "OPENSSL")
-    add_definitions(-DTLS_BACKEND_OPENSSL)
-  elseif(TLS_BACKEND STREQUAL "GNUTLS")
-    add_definitions(-DTLS_BACKEND_GNUTLS)
+  if( NOT USE_OPENSSL AND NOT USE_GNUTLS)
+    list(APPEND TLS_COMPONENTS "openssl")
+    list(APPEND TLS_COMPONENTS "gnutls")
   endif()
+
+  find_package(TLS REQUIRED ${TLS_COMPONENTS})
 
   # Add TLS libraries to system libraries
   if (TLS_FOUND)

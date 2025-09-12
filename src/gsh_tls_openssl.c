@@ -37,7 +37,6 @@
 #include "gsh_tls.h"
 
 /* Global SSL context */
-static SSL_CTX *global_ctx = NULL;
 static int ssl_ctx_index = -1;
 static void gsh_tls_info_callback(const SSL *ssl, int where, int ret);
 
@@ -60,29 +59,36 @@ unsigned char sid_ctx[] = "ganesha-nfs-session";
  *
  * @param cert_file    Path to the server certificate file (PEM format)
  * @param key_file     Path to the server private key file (PEM format)
- * @param ca_file      Path to the CA certificate file (PEM format) for client verification
+ * @param ca_file      Path to the CA certificate file (PEM format) for
+ *			client verification
  * @param ciphers      Cipher suite string (GnuTLS priority string)
  * @param min_version  Minimum TLS version ("TLSv1.2" or "TLSv1.3")
  * @param ktls         To enable or disable ktls
- * @param debug        To enable or disable debugging including registering lib callbacks
- * @return             true on success, false on failure
+ * @param debug        To enable or disable debugging including registering
+ *			lib callbacks
+ * @return             Creds which should be used for per session connection
+ *			creation, if fails returns NULL.
  */
-bool gsh_tls_init(const char *cert_file, const char *key_file,
-		  const char *ca_file, const char *ciphers,
-		  const char *min_version, bool ktls, bool debug)
+gsh_tls_cred_t *gsh_tls_init(const char *cert_file, const char *key_file,
+			     const char *ca_file, const char *ciphers,
+			     const char *min_version, bool ktls, bool debug)
 {
-	LogDebugTLS(DPP_INIT, "%s:%d", __func__, __LINE__);
+	SSL_CTX *global_ctx = NULL;
+
+	LogDebugTLS(TLS_INIT, "%s:%" PRId32 , __func__, __LINE__);
 	/* Initialize OpenSSL */
 	SSL_library_init();
 	SSL_load_error_strings();
 	OpenSSL_add_all_algorithms();
+	const SSL_METHOD *method = TLS_method(); // supports both client/server
 
 	/* Create SSL context */
-	global_ctx = SSL_CTX_new(TLS_server_method());
+	//global_ctx = SSL_CTX_new(TLS_server_method());
+	global_ctx = SSL_CTX_new(method);
 	if (!global_ctx) {
-		LogCritTLS(DPP_INIT, "Failed to create SSL context: %s",
+		LogCritTLS(TLS_INIT, "Failed to create SSL context: %s",
 			   get_ssl_error());
-		return false;
+		return NULL;
 	}
 	if (debug)
 		SSL_CTX_set_info_callback(global_ctx, gsh_tls_info_callback);
@@ -95,6 +101,7 @@ bool gsh_tls_init(const char *cert_file, const char *key_file,
 	/* Set minimum TLS version */
 	if (min_version) {
 		int version = 0;
+
 		if (strcmp(min_version, "TLSv1.2") == 0)
 			version = TLS1_2_VERSION;
 		else if (strcmp(min_version, "TLSv1.3") == 0)
@@ -108,166 +115,154 @@ bool gsh_tls_init(const char *cert_file, const char *key_file,
 
 	/* Set cipher list if provided */
 	if (ciphers && SSL_CTX_set_cipher_list(global_ctx, ciphers) != 1) {
-		LogCritTLS(DPP_INIT, "Failed to set cipher list: %s",
+		LogCritTLS(TLS_INIT, "Failed to set cipher list: %s",
 			   get_ssl_error());
 		SSL_CTX_free(global_ctx);
 		global_ctx = NULL;
-		return false;
+		return NULL;
 	}
 
 	/* Load server certificate */
 	if (SSL_CTX_use_certificate_file(global_ctx, cert_file,
 					 SSL_FILETYPE_PEM) != 1) {
-		LogCritTLS(DPP_INIT, "Failed to load certificate file %s: %s",
+		LogCritTLS(TLS_INIT, "Failed to load certificate file %s: %s",
 			   cert_file, get_ssl_error());
 		SSL_CTX_free(global_ctx);
 		global_ctx = NULL;
-		return false;
+		return NULL;
 	}
 
 	/* Load certificate */
 	if (SSL_CTX_use_certificate_chain_file(global_ctx, cert_file) != 1) {
-		LogCritTLS(DPP_INIT, "Failed to load certificate file '%s': %s",
+		LogCritTLS(TLS_INIT, "Failed to load certificate file '%s': %s",
 			   cert_file, ERR_error_string(ERR_get_error(), NULL));
 		SSL_CTX_free(global_ctx);
 		global_ctx = NULL;
-		return false;
+		return NULL;
 	}
 
 	/* Load private key */
 	if (SSL_CTX_use_PrivateKey_file(global_ctx, key_file,
 					SSL_FILETYPE_PEM) != 1) {
-		LogCritTLS(DPP_INIT, "Failed to load private key file %s: %s",
+		LogCritTLS(TLS_INIT, "Failed to load private key file %s: %s",
 			   key_file, get_ssl_error());
 		SSL_CTX_free(global_ctx);
 		global_ctx = NULL;
-		return false;
+		return NULL;
 	}
 
 	/* Check key and certificate */
 	if (SSL_CTX_check_private_key(global_ctx) != 1) {
-		LogCritTLS(DPP_INIT,
+		LogCritTLS(TLS_INIT,
 			   "Private key does not match certificate: %s",
 			   get_ssl_error());
 		SSL_CTX_free(global_ctx);
 		global_ctx = NULL;
-		return false;
+		return NULL;
 	}
 
 	/* Load CA certificates for client verification */
 	if (ca_file) {
 		if (SSL_CTX_load_verify_locations(global_ctx, ca_file, NULL) !=
 		    1) {
-			LogCritTLS(DPP_INIT, "Failed to load CA file %s: %s",
+			LogCritTLS(TLS_INIT, "Failed to load CA file %s: %s",
 				   ca_file, get_ssl_error());
 			SSL_CTX_free(global_ctx);
 			global_ctx = NULL;
-			return false;
+			return NULL;
 		}
 
 		SSL_CTX_set_verify(global_ctx, SSL_VERIFY_PEER, NULL);
 	} else {
 		/* Use default system CA certificates */
 		if (SSL_CTX_set_default_verify_paths(global_ctx) != 1) {
-			LogWarnTLS(DPP_INIT,
+			LogWarnTLS(TLS_INIT,
 				   "Failed to set default verify paths: %s",
 				   ERR_error_string(ERR_get_error(), NULL));
 			SSL_CTX_free(global_ctx);
 			global_ctx = NULL;
-			return false;
-			/* Not fatal, continue anyway */
+			return NULL;
 		}
 	}
 
-	// Disable replay protection to ensure early data features are off
-	//SSL_CTX_set_options(global_ctx, SSL_OP_NO_ANTI_REPLAY);
-
-	// Explicitly set max early data to 0 bytes -- this turns support off
-	//SSL_CTX_set_max_early_data(global_ctx, 0);
-
+#if 0
 	/* Enable session caching */
 	SSL_CTX_set_session_cache_mode(global_ctx, SSL_SESS_CACHE_SERVER);
 	SSL_CTX_set_timeout(global_ctx, 300); /* 5 minutes session timeout */
 
-#if 0
-    /* Enable session tickets */
-    if (SSL_CTX_set_session_ticket_cb(global_ctx, NULL, NULL, NULL) != 1) {
-        LogWarnTLS(DPP_INIT, "Failed to enable session tickets: %s",
-                ERR_error_string(ERR_get_error(), NULL));
-        /* Not fatal, continue anyway */
-    }
+	/* Enable session tickets */
+	if (SSL_CTX_set_session_ticket_cb(global_ctx, NULL, NULL, NULL) != 1) {
+		LogWarnTLS(TLS_INIT, "Failed to enable session tickets: %s",
+				ERR_error_string(ERR_get_error(), NULL));
+		/* Not fatal, continue anyway */
+	}
 #endif
 
-	/* Set up an ex_data index for associating gsh_tls_ctx_t with SSL objects */
+	/* Set up an ex_data index for associating
+	 * gsh_tls_ctx_t with SSL objects */
 	ssl_ctx_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, NULL);
 	if (ssl_ctx_index == -1) {
-		LogCritTLS(DPP_INIT, "Failed to get SSL ex_data index");
+		LogCritTLS(TLS_INIT, "Failed to get SSL ex_data index");
 		exit(1);
 	}
-	/*
-    	if (!SSL_CTX_set_options(global_ctx, SSL_OP_NO_RENEGOTIATION)) {
-        	LogCritTLS(DPP_INIT, "Failed to set RENEGOTITAION FLAG on SSL");
-	        exit(1);
-	}*/
 	if (!SSL_CTX_set_num_tickets(global_ctx, 1)) {
-		LogCritTLS(DPP_INIT, "Failed to set num tickets on SSL");
+		LogCritTLS(TLS_INIT, "Failed to set num tickets on SSL");
 		exit(1);
 	}
 
-	LogDebugTLS(DPP_INIT, "TLS initialized successfully with OpenSSL");
-	return true;
+	LogDebugTLS(TLS_INIT, "TLS initialized successfully with OpenSSL");
+	return global_ctx;
 }
 
 /**
  * Create a new TLS context for a socket
  *
  * @param fd           Socket file descriptor
+ * @param cred         creds which got returned from gsh_tls_init()
+ * @param is_server    Connection type i.e fd is acting as server or a client.
  * @return             Pointer to the new TLS context, or NULL on failure
  */
-gsh_tls_ctx_t *gsh_tls_ctx_init(int fd)
+gsh_tls_ctx_t *gsh_tls_ctx_init(int fd, gsh_tls_cred_t *cred, bool is_server)
 {
-	gsh_tls_ctx_t *ctx;
-	LogDebugTLS(DPP_INIT, "%s:%d", __func__, __LINE__);
+	gsh_tls_ctx_t *ctx = calloc(1, sizeof(gsh_tls_ctx_t));
 
-	if (!global_ctx) {
-		LogCritTLS(DPP_INIT, "TLS not initialized");
+	if (!ctx)
 		return NULL;
-	}
 
-	ctx = calloc(1, sizeof(gsh_tls_ctx_t));
-	if (!ctx) {
-		LogCritTLS(DPP_INIT, "Failed to allocate TLS context");
-		return NULL;
-	}
 	pthread_mutex_init(&(ctx->ctx_lock), NULL);
 	ctx->fd = fd;
-	ctx->ssl = SSL_new(global_ctx);
+	ctx->ctx = cred;
+
+	ctx->ssl = SSL_new(ctx->ctx);
 	if (!ctx->ssl) {
-		LogCritTLS(DPP_INIT, "Failed to create SSL: %s",
+		LogCritTLS(TLS_INIT, "Failed to create SSL: %s",
 			   get_ssl_error());
 		free(ctx);
 		return NULL;
 	}
-	//SSL_set_max_early_data(ctx->ssl, 0);
 
-	ctx->ctx = global_ctx;
-
-	/* Associate SSL with socket */
-	if (SSL_set_fd(ctx->ssl, fd) != 1) {
-		LogCritTLS(DPP_INIT, "Failed to set SSL fd: %s",
+	if (!SSL_set_fd(ctx->ssl, fd)) {
+		LogCritTLS(TLS_INIT, "Failed to set SSL fd: %s",
 			   get_ssl_error());
 		SSL_free(ctx->ssl);
 		free(ctx);
 		return NULL;
 	}
-
 	if (!SSL_set_ex_data(ctx->ssl, ssl_ctx_index, ctx)) {
-		LogCritTLS(DPP_INIT, "Failed to set ex_data on SSL");
+		LogCritTLS(TLS_INIT, "Failed to set ex_data on SSL");
 		SSL_free(ctx->ssl);
 		free(ctx);
 		return NULL;
 	}
-	LogDebugTLS(DPP_INIT, "ctx >>>>>>>>>>:%x", ctx);
+	// Optionally set server/client specific behavior before handshake
+	if (is_server) {
+		LogEventTLS(TLS_INIT, "FD:%" PRId32 " SERVER_METHOD", fd);
+		SSL_set_accept_state(ctx->ssl); // server
+	} else {
+		LogEventTLS(TLS_INIT, "FD:%" PRId32 " CLIENT_METHOD", fd);
+		SSL_set_connect_state(ctx->ssl); // client
+	}
+
 	return ctx;
 }
 
@@ -282,9 +277,10 @@ bool gsh_tls_handshake(gsh_tls_ctx_t *ctx)
 	int ret;
 	int ssl_err;
 	int counter = 0;
-	LogDebugTLS(DPP_HANDSHAKE, "%s:%d", __func__, __LINE__);
+
+	LogDebugTLS(TLS_HANDSHAKE, "%s:%" PRId32 , __func__, __LINE__);
 	if (!ctx || !ctx->ssl) {
-		LogCritTLS(DPP_INIT, "Invalid TLS context");
+		LogCritTLS(TLS_INIT, "Invalid TLS context");
 		return false;
 	}
 	pthread_mutex_lock(&(ctx->ctx_lock));
@@ -300,7 +296,7 @@ retry:
 	ret = SSL_accept(ctx->ssl);
 	if (ret == 1) {
 		ctx->handshake_complete = true;
-		LogDebugTLS(DPP_HANDSHAKE,
+		LogDebugTLS(TLS_HANDSHAKE,
 			    "TLS handshake completed successfully");
 		const char *servername =
 			SSL_get_servername(ctx->ssl, TLSEXT_NAMETYPE_host_name);
@@ -316,16 +312,16 @@ retry:
 	ssl_err = SSL_get_error(ctx->ssl, ret);
 	if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
 		/* Handshake needs more data, not an error */
-		LogDebugTLS(DPP_HANDSHAKE, "Need more data:%s : %d",
+		LogDebugTLS(TLS_HANDSHAKE, "Need more data:%s : %" PRId32 ,
 			    get_ssl_error(), ssl_err);
 	}
 	if (counter < 1) {
-		LogDebugTLS(DPP_HANDSHAKE, "retry %s : %d", get_ssl_error(),
-			    ssl_err);
+		LogDebugTLS(TLS_HANDSHAKE, "retry %s : %" PRId32 ,
+			    get_ssl_error(), ssl_err);
 		goto retry;
 	}
 
-	LogCritTLS(DPP_HANDSHAKE, "TLS handshake failed: %s", get_ssl_error());
+	LogCritTLS(TLS_HANDSHAKE, "TLS handshake failed: %s", get_ssl_error());
 	pthread_mutex_unlock(&(ctx->ctx_lock));
 	return false;
 }
@@ -339,11 +335,14 @@ retry:
 bool get_tls_type(gsh_tls_ctx_t *ctx)
 {
 	bool ret = false;
+
 	if (!ctx->ssl)
 		return ret;
 	X509 *cert = SSL_get_peer_certificate(ctx->ssl);
+
 	if (cert) {
 		long verify_result = SSL_get_verify_result(ctx->ssl);
+
 		X509_free(cert);
 		if (verify_result == X509_V_OK) {
 			ret = true;
@@ -351,7 +350,7 @@ bool get_tls_type(gsh_tls_ctx_t *ctx)
 			ret = false;
 		}
 	}
-	LogDebugTLS(DPP_HANDSHAKE, "MTLS CERIFICATE %d", ret);
+	LogDebugTLS(TLS_HANDSHAKE, "MTLS CERIFICATE %" PRId32 , ret);
 	return ret;
 }
 
@@ -369,17 +368,18 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 	X509 *cert;
 	X509_NAME *subject;
 	char buf[256];
-	LogDebugTLS(DPP_HANDSHAKE, "%s:%d", __func__, __LINE__);
+
+	LogDebugTLS(TLS_HANDSHAKE, "%s:%" PRId32 , __func__, __LINE__);
 
 	if (!ctx || !ctx->ssl) {
-		LogCritTLS(DPP_HANDSHAKE, "Invalid TLS context");
+		LogCritTLS(TLS_HANDSHAKE, "Invalid TLS context");
 		return false;
 	}
 
 	/* Get client certificate */
 	cert = SSL_get_peer_certificate(ctx->ssl);
 	if (!cert) {
-		LogDebugTLS(DPP_HANDSHAKE,
+		LogDebugTLS(TLS_HANDSHAKE,
 			    "Client did not provide a certificate");
 		if (peer_identity && id_size > 0)
 			strlcpy(peer_identity, "anonymous", id_size);
@@ -388,8 +388,9 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 
 	/* Verify certificate */
 	long verify_result = SSL_get_verify_result(ctx->ssl);
+
 	if (verify_result != X509_V_OK) {
-		LogWarnTLS(DPP_HANDSHAKE,
+		LogWarnTLS(TLS_HANDSHAKE,
 			   "Client certificate verification failed: %s",
 			   X509_verify_cert_error_string(verify_result));
 		X509_free(cert);
@@ -399,7 +400,7 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 	/* Extract Common Name from certificate */
 	subject = X509_get_subject_name(cert);
 	if (!subject) {
-		LogWarnTLS(DPP_HANDSHAKE,
+		LogWarnTLS(TLS_HANDSHAKE,
 			   "Could not get subject from client certificate");
 		X509_free(cert);
 		return false;
@@ -409,7 +410,7 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 	int cn_len = X509_NAME_get_text_by_NID(subject, NID_commonName, buf,
 					       sizeof(buf));
 	if (cn_len < 0) {
-		LogWarnTLS(DPP_HANDSHAKE,
+		LogWarnTLS(TLS_HANDSHAKE,
 			   "Could not get CN from client certificate");
 		X509_free(cert);
 		return false;
@@ -420,7 +421,7 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 		strlcpy(peer_identity, buf, id_size);
 	}
 
-	LogDebugTLS(DPP_HANDSHAKE,
+	LogDebugTLS(TLS_HANDSHAKE,
 		    "Client authenticated with certificate CN: %s", buf);
 	X509_free(cert);
 	return true;
@@ -436,48 +437,51 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
  */
 int gsh_tls_recv(gsh_tls_ctx_t *ctx, void *buf, size_t len, int flags)
 {
-        int ret;
-        int error_code = 0;
-        int fd = ctx->fd;
-        int orig_flags = fcntl(fd, F_GETFL, 0);
-        //bool nonblock = flags & MSG_DONTWAIT;
-        bool nonblock = 0;
-        ssize_t offset = 0;
+	int ret;
+	int error_code = 0;
+	int fd = ctx->fd;
+	int orig_flags = fcntl(fd, F_GETFL, 0);
+	//bool nonblock = flags & MSG_DONTWAIT;
+	bool nonblock = 0;
+	ssize_t offset = 0;
 
-        if (!ctx || !ctx->ssl)
-                return EINVAL;
+	if (!ctx || !ctx->ssl)
+		return EINVAL;
 
-        if (nonblock)
-                fcntl(fd, F_SETFL, orig_flags | O_NONBLOCK);
+	if (nonblock)
+		fcntl(fd, F_SETFL, orig_flags | O_NONBLOCK);
 
-        LogDebugTLS(DPP_DISPATCH, "Recv requested len > %d", len);
+	LogDebugTLS(TLS_DISPATCH, "Recv requested len > %" PRId32 , len);
 
 	while (offset < len) {
 retry:
 		ret = SSL_read(ctx->ssl, buf + offset, len - offset);
-        	LogDebugTLS(DPP_DISPATCH, "Recv requested len >> %d ret:%d ", len, ret);
 		if (ret <= 0) {
 			int ssl_err = SSL_get_error(ctx->ssl, ret);
-			switch(ssl_err) {
+
+			LogDebugTLS(TLS_DISPATCH, "Read ret:%" PRId32
+				   " error:%" PRId32 " %" PRId32 ,
+				    ret, ssl_err, errno);
+			switch (ssl_err) {
 			case SSL_ERROR_WANT_READ:
 			case SSL_ERROR_WANT_WRITE:
 				goto retry;
 			case SSL_ERROR_NONE:
 			case SSL_ERROR_SYSCALL:
-				error_code =  GSH_SESSION_CLOSED_ADRUPTLY;
+				error_code = GSH_SESSION_CLOSED_ADRUPTLY;
 				break;
 			default:
 				error_code = GSH_SESSION_UNKNOWN_ERROR;
-                                break;
+				break;
 			}
-			 LogDebugTLS(DPP_DISPATCH, "Read ret:%d error:%d %d",
-                                    ret, ssl_err, errno);
 			return error_code;
 		}
 		offset += ret;
 	}
-	LogDebugTLS(DPP_DISPATCH, "buf:%p Read:Len:%d ", buf, offset);
+	if (nonblock)
+		fcntl(fd, F_SETFL, orig_flags); // Restore original flags
 
+	LogDebugTLS(TLS_DISPATCH, "Recv Completed len: %" PRId64 , offset);
 	return offset;
 }
 
@@ -499,13 +503,13 @@ int gsh_tls_send(gsh_tls_ctx_t *ctx, const struct msghdr *msg, int flags)
 	int error_code = 0;
 
 	if (!ctx->ssl)
-                return EINVAL;
+		return EINVAL;
 
 	if (nonblock)
 		fcntl(fd, F_SETFL, orig_flags | O_NONBLOCK);
 
-
-	LogDebugTLS(DPP_DISPATCH, "Send requested len > %d", msg->msg_iovlen);
+	LogDebugTLS(TLS_DISPATCH, "Send requested len > %" PRId32 ,
+		    msg->msg_iovlen);
 	for (int i = 0; i < msg->msg_iovlen; ++i) {
 		const char *buf = msg->msg_iov[i].iov_base;
 		ssize_t len = msg->msg_iov[i].iov_len;
@@ -514,23 +518,26 @@ retry:
 		while (offset < len) {
 			int ret =
 				SSL_write(ctx->ssl, buf + offset, len - offset);
-        			LogDebugTLS(DPP_DISPATCH, "Send requested len >> %d ret:%d ", len, ret);
 			if (ret <= 0) {
 				int ssl_err = SSL_get_error(ctx->ssl, ret);
-				switch(ssl_err) {
-					case SSL_ERROR_WANT_READ:
-					case SSL_ERROR_WANT_WRITE:
-						goto retry;
-					case SSL_ERROR_NONE:
-					case SSL_ERROR_SYSCALL:
-						error_code =  GSH_SESSION_CLOSED_ADRUPTLY;
-						break;
-					default:
-						error_code = GSH_SESSION_UNKNOWN_ERROR;
-						break;
+
+				LogDebugTLS(TLS_DISPATCH,
+					    "Write ret:%" PRId32 " error:%"
+					    PRId32 " %" PRId32 , ret,
+					    ssl_err, errno);
+				switch (ssl_err) {
+				case SSL_ERROR_WANT_READ:
+				case SSL_ERROR_WANT_WRITE:
+					goto retry;
+				case SSL_ERROR_NONE:
+				case SSL_ERROR_SYSCALL:
+					error_code =
+						GSH_SESSION_CLOSED_ADRUPTLY;
+					break;
+				default:
+					error_code = GSH_SESSION_UNKNOWN_ERROR;
+					break;
 				}
-				LogDebugTLS(DPP_DISPATCH, "Write ret:%d error:%d %d",
-						ret, ssl_err, errno);
 				return error_code;
 			}
 			offset += ret;
@@ -541,7 +548,7 @@ retry:
 	if (nonblock)
 		fcntl(fd, F_SETFL, orig_flags); // Restore original flags
 
-	LogDebugTLS(DPP_DISPATCH, "TLS write complete: %ld", total_sent);
+	LogDebugTLS(TLS_DISPATCH, "Send Completed len: %" PRId64 , total_sent);
 	return total_sent;
 }
 
@@ -553,8 +560,9 @@ retry:
  */
 bool gsh_tls_close(gsh_tls_ctx_t *ctx)
 {
-	LogDebugTLS(DPP_SHUTDOWN, "ctx:%x", ctx);
+	LogDebugTLS(TLS_SHUTDOWN, "ctx:%x", ctx);
 	int ret = 0;
+
 	if (!ctx) {
 		return true;
 	}
@@ -562,24 +570,26 @@ bool gsh_tls_close(gsh_tls_ctx_t *ctx)
 	if (ctx->ssl) {
 		/* write direction of the connection */
 		ret = SSL_shutdown(ctx->ssl);
-		LogDebugTLS(DPP_SHUTDOWN, "shutdown %d", ret);
+		LogDebugTLS(TLS_SHUTDOWN, "shutdown %" PRId32 , ret);
 		if (ret == 0) {
-			// If return is 0, we need to call it again to complete bidirectional shutdown
-			/*read direction of the connection */
+			/* If return is 0, we need to call it again to complete
+			 * bidirectional shutdown
+			 * i.e read direction of the connection */
 			ret = SSL_shutdown(ctx->ssl);
-			LogDebugTLS(DPP_SHUTDOWN, "shutdown1 %d", ret);
+			LogDebugTLS(TLS_SHUTDOWN, "shutdown1 %" PRId32 , ret);
 		}
 
 		if (ret < 0) {
 			// Optionally log SSL error
 			int err = SSL_get_error(ctx->ssl, ret);
-			LogDebugTLS(DPP_SHUTDOWN, "shutdown failed %d :%d", ret,
-				    err);
+
+			LogDebugTLS(TLS_SHUTDOWN, "shutdown failed %" PRId32
+				    " :%" PRId32 , ret, err);
 		}
 		SSL_free(ctx->ssl);
 	}
 
-	LogDebugTLS(DPP_SHUTDOWN, "freeing ctx ret:%d", ret);
+	LogDebugTLS(TLS_SHUTDOWN, "freeing ctx ret:%" PRId32 , ret);
 	free(ctx);
 	return true;
 }
@@ -598,42 +608,45 @@ bool gsh_tls_close(gsh_tls_ctx_t *ctx)
 bool gsh_tls_key_update(gsh_tls_ctx_t *ctx)
 {
 	if (!ctx || !ctx->ssl) {
-		LogWarnTLS(DPP_HANDSHAKE, "Invalid ctx\n");
+		LogWarnTLS(TLS_HANDSHAKE, "Invalid ctx");
 		return false;
 	}
 
 	if (SSL_version(ctx->ssl) != TLS1_3_VERSION) {
-		LogWarnTLS(DPP_HANDSHAKE,
-			  "Key update is only supported in TLS 1.3\n");
+		LogWarnTLS(TLS_HANDSHAKE,
+			   "Key update is only supported in TLS 1.3");
 		return false;
 	}
 	int is_ktls_send = BIO_get_ktls_send(SSL_get_wbio(ctx->ssl));
 	int is_ktls_recv = BIO_get_ktls_recv(SSL_get_rbio(ctx->ssl));
-	LogWarnTLS(DPP_HANDSHAKE, "is_KTLS_rec:%d isKTLS_send:%d\n",
-		   is_ktls_send, is_ktls_recv);
+
+	LogWarnTLS(TLS_HANDSHAKE, "is_KTLS_rec:%" PRId32 " isKTLS_send:%"
+		   PRId32 , is_ktls_send, is_ktls_recv);
 
 	/* return false directly , which will shutdown the connection
-         * or can try the openssl */
+	 * or can try the openssl */
 	if (is_ktls_send || is_ktls_recv) {
 		return false;
 	}
 
 	// Request peer to update keys for both directions
 	if (!SSL_key_update(ctx->ssl, SSL_KEY_UPDATE_REQUESTED)) {
-		LogWarnTLS(DPP_HANDSHAKE, "SSL_key_update failed\n");
+		LogWarnTLS(TLS_HANDSHAKE, "SSL_key_update failed");
 		return false;
 	}
 
 	// SSL_do_handshake must be called to complete the key update process
 	if (SSL_do_handshake(ctx->ssl) <= 0) {
 		int err = SSL_get_error(ctx->ssl, -1);
-		LogWarnTLS(DPP_HANDSHAKE, "SSL_do_handshake failed: %d (%s)\n",
-			   err, ERR_reason_error_string(ERR_get_error()));
+
+		LogWarnTLS(TLS_HANDSHAKE, "SSL_do_handshake failed: %" PRId32
+			  " (%s)\n",
+			  err, ERR_reason_error_string(ERR_get_error()));
 		return false;
 	}
 
-	LogWarnTLS(DPP_INIT,
-		   " Key update requested and handshake completed.\n");
+	LogWarnTLS(TLS_INIT,
+		   " Key update requested and handshake completed.");
 	return true;
 }
 
@@ -643,24 +656,26 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 	const char *str = SSL_state_string_long(ssl);
 	const char *prefix = "";
 	const char *direction = "";
-	static int handshake_started = 0;
+	static int handshake_started;
 
 	/* Handshake state tracking */
 	if (where & SSL_CB_HANDSHAKE_START) {
 		prefix = "[HANDSHAKE START]";
 		handshake_started = 1;
-		LogWarnTLS(DPP_INIT, "%s : %s", prefix, str);
+		LogWarnTLS(TLS_INIT, "%s : %s", prefix, str);
 
 		/* Log additional handshake details */
 		const char *version = SSL_get_version(ssl);
-		LogDebugTLS(DPP_UNKNOWN,
+
+		LogDebugTLS(TLS_UNKNOWN,
 			    "[HANDSHAKE START] Protocol version: %s",
 			    version ? version : "unknown");
 
 		/* Log cipher information if available */
 		const SSL_CIPHER *cipher = SSL_get_current_cipher(ssl);
+
 		if (cipher) {
-			LogDebugTLS(DPP_UNKNOWN, "[HANDSHAKE START] Cipher: %s",
+			LogDebugTLS(TLS_UNKNOWN, "[HANDSHAKE START] Cipher: %s",
 				    SSL_CIPHER_get_name(cipher));
 		}
 		return;
@@ -674,39 +689,39 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 		}
 		handshake_started = 0;
 
-		LogWarnTLS(DPP_INIT, "%s : %s", prefix, str);
+		LogWarnTLS(TLS_INIT, "%s : %s", prefix, str);
 
 		/* Log detailed handshake completion information */
 		const SSL_CIPHER *cipher = SSL_get_current_cipher(ssl);
+
 		if (cipher) {
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[HANDSHAKE DONE] Final cipher: %s",
 				    SSL_CIPHER_get_name(cipher));
-			LogDebugTLS(DPP_UNKNOWN,
-				    "[HANDSHAKE DONE] Cipher bits: %d",
+			LogDebugTLS(TLS_UNKNOWN,
+				    "[HANDSHAKE DONE] Cipher bits: %" PRId32 ,
 				    SSL_CIPHER_get_bits(cipher, NULL));
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[HANDSHAKE DONE] Cipher version: %s",
 				    SSL_CIPHER_get_version(cipher));
 		}
 
 		/* Log protocol version */
-		LogDebugTLS(DPP_UNKNOWN, "[HANDSHAKE DONE] Protocol: %s",
+		LogDebugTLS(TLS_UNKNOWN, "[HANDSHAKE DONE] Protocol: %s",
 			    SSL_get_version(ssl));
 
 		/* Log session information */
 		SSL_SESSION *session = SSL_get_session(ssl);
+
 		if (session) {
-			LogDebugTLS(DPP_UNKNOWN,
-				    "[HANDSHAKE DONE] Session timeout: %ld",
-				    SSL_SESSION_get_timeout(session));
+			LogDebugTLS(TLS_UNKNOWN,
+				    "[HANDSHAKE DONE] Session timeout: %" PRId64
+				    , SSL_SESSION_get_timeout(session));
 			if (SSL_session_reused(ssl)) {
-				LogDebugTLS(
-					DPP_UNKNOWN,
+				LogDebugTLS(TLS_UNKNOWN,
 					"[HANDSHAKE DONE] Session was reused");
 			} else {
-				LogDebugTLS(
-					DPP_UNKNOWN,
+				LogDebugTLS(TLS_UNKNOWN,
 					"[HANDSHAKE DONE] New session created");
 			}
 		}
@@ -715,7 +730,7 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 		const char *servername =
 			SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 		if (servername) {
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[HANDSHAKE DONE] SNI hostname: %s",
 				    servername);
 		}
@@ -723,12 +738,14 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 		/* Check for ALPN */
 		const unsigned char *alpn_selected;
 		unsigned int alpn_len;
+
 		SSL_get0_alpn_selected(ssl, &alpn_selected, &alpn_len);
 		if (alpn_selected && alpn_len > 0) {
 			char alpn_str[256];
+
 			snprintf(alpn_str, sizeof(alpn_str), "%.*s", alpn_len,
 				 alpn_selected);
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[HANDSHAKE DONE] ALPN protocol: %s",
 				    alpn_str);
 		}
@@ -736,11 +753,12 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 		/* Check KTLS status */
 		BIO *wbio = SSL_get_wbio(ssl);
 		BIO *rbio = SSL_get_rbio(ssl);
+
 		if (wbio && rbio) {
 			int ktls_send = BIO_get_ktls_send(wbio);
 			int ktls_recv = BIO_get_ktls_recv(rbio);
-			LogDebugTLS(
-				DPP_UNKNOWN,
+
+			LogDebugTLS(TLS_UNKNOWN,
 				"[HANDSHAKE DONE] KTLS status - send: %s, recv: %s",
 				ktls_send ? "enabled" : "disabled",
 				ktls_recv ? "enabled" : "disabled");
@@ -758,9 +776,9 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 		const char *alert_desc = SSL_alert_desc_string_long(desc);
 		const char *alert_type = SSL_alert_type_string_long(ret);
 
-		LogWarnTLS(
-			DPP_UNKNOWN,
-			"[ALERT] %s: level=%s, desc=%d (%s) type=(%s) state=(%s)",
+		LogWarnTLS(TLS_UNKNOWN,
+			"[ALERT] %s: level=%s, desc=%" PRId32
+			" (%s) type=(%s) state=(%s)",
 			direction, level_str, desc,
 			alert_desc ? alert_desc : "unknown",
 			alert_type ? alert_type : "unknown", str);
@@ -768,80 +786,80 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 		/* Log additional context for specific alerts */
 		switch (desc) {
 		case SSL_AD_CLOSE_NOTIFY:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				"[ALERT] Connection being closed gracefully");
 			break;
 		case SSL_AD_HANDSHAKE_FAILURE:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				"[ALERT] Handshake failure - check cipher compatibility");
 			break;
 		case SSL_AD_BAD_CERTIFICATE:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				"[ALERT] Bad certificate - certificate validation failed");
 			break;
 		case SSL_AD_CERTIFICATE_EXPIRED:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Certificate has expired");
 			break;
 		case SSL_AD_CERTIFICATE_UNKNOWN:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				"[ALERT] Certificate unknown or not trusted");
 			break;
 		case SSL_AD_ILLEGAL_PARAMETER:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Illegal parameter in handshake");
 			break;
 		case SSL_AD_DECODE_ERROR:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Message decode error");
 			break;
 		case SSL_AD_DECRYPT_ERROR:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Message decryption error");
 			break;
 		case SSL_AD_PROTOCOL_VERSION:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Protocol version not supported");
 			break;
 		case SSL_AD_INSUFFICIENT_SECURITY:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Insufficient security level");
 			break;
 		case SSL_AD_INTERNAL_ERROR:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Internal error occurred");
 			break;
 		case SSL_AD_USER_CANCELLED:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] User cancelled the operation");
 			break;
 		case SSL_AD_NO_RENEGOTIATION:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Renegotiation not allowed");
 			break;
 		case SSL_AD_UNSUPPORTED_EXTENSION:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Unsupported extension");
 			break;
 		case SSL_AD_CERTIFICATE_UNOBTAINABLE:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Certificate unobtainable");
 			break;
 		case SSL_AD_UNRECOGNIZED_NAME:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Unrecognized name (SNI mismatch)");
 			break;
 		case SSL_AD_BAD_CERTIFICATE_STATUS_RESPONSE:
-			LogDebugTLS(
-				DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				"[ALERT] Bad certificate status response (OCSP)");
 			break;
 		case SSL_AD_BAD_CERTIFICATE_HASH_VALUE:
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "[ALERT] Bad certificate hash value");
 			break;
 		default:
-			LogDebugTLS(DPP_UNKNOWN, "[ALERT] Alert code %d", desc);
+			LogDebugTLS(TLS_UNKNOWN, "[ALERT] Alert code %" PRId32
+				    , desc);
 			break;
 		}
 		return;
@@ -857,32 +875,32 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 
 		/* Detailed state analysis */
 		if (strstr(str, "read") || strstr(str, "Read")) {
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "%s : %s [Reading data/handshake messages]",
 				    prefix, str);
 		} else if (strstr(str, "write") || strstr(str, "Write")) {
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "%s : %s [Writing data/handshake messages]",
 				    prefix, str);
 		} else if (strstr(str, "certificate") ||
 			   strstr(str, "Certificate")) {
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "%s : %s [Certificate processing]", prefix,
 				    str);
 		} else if (strstr(str, "key") || strstr(str, "Key")) {
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "%s : %s [Key exchange/processing]", prefix,
 				    str);
 		} else if (strstr(str, "cipher") || strstr(str, "Cipher")) {
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "%s : %s [Cipher negotiation/setup]",
 				    prefix, str);
 		} else if (strstr(str, "finished") || strstr(str, "Finished")) {
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "%s : %s [Handshake finishing]", prefix,
 				    str);
 		} else {
-			LogWarnTLS(DPP_UNKNOWN, "%s : %s", prefix, str);
+			LogWarnTLS(TLS_UNKNOWN, "%s : %s", prefix, str);
 		}
 		return;
 	}
@@ -890,27 +908,30 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 	if (where & SSL_CB_EXIT) {
 		if (ret == 0) {
 			prefix = "[EXIT] failed";
-			LogWarnTLS(DPP_UNKNOWN, "%s : %s [Operation failed]",
+			LogWarnTLS(TLS_UNKNOWN, "%s : %s [Operation failed]",
 				   prefix, str);
 
 			/* Log additional error information */
 			unsigned long err = ERR_peek_last_error();
+
 			if (err != 0) {
 				char err_buf[256];
+
 				ERR_error_string_n(err, err_buf,
 						   sizeof(err_buf));
-				LogDebugTLS(DPP_UNKNOWN,
+				LogDebugTLS(TLS_UNKNOWN,
 					    "[EXIT] Last error: %s", err_buf);
 			}
 		} else if (ret < 0) {
 			prefix = "[EXIT] error";
-			LogWarnTLS(DPP_UNKNOWN,
-				   "%s : %s [Error condition, ret=%d]", prefix,
-				   str, ret);
+			LogWarnTLS(TLS_UNKNOWN,
+				   "%s : %s [Error condition, ret=%"
+				   PRId32 "]", prefix, str, ret);
 
 			/* Log SSL error details */
 			int ssl_err = SSL_get_error(ssl, ret);
 			const char *ssl_err_str = "";
+
 			switch (ssl_err) {
 			case SSL_ERROR_NONE:
 				ssl_err_str = "SSL_ERROR_NONE";
@@ -943,11 +964,11 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 				ssl_err_str = "SSL_ERROR_UNKNOWN";
 				break;
 			}
-			LogDebugTLS(DPP_UNKNOWN, "[EXIT] SSL error: %s (%d)",
-				    ssl_err_str, ssl_err);
+			LogDebugTLS(TLS_UNKNOWN, "[EXIT] SSL error: %s (%"
+				    PRId32 ")", ssl_err_str, ssl_err);
 		} else {
 			prefix = "[EXIT] ok";
-			LogDebugTLS(DPP_UNKNOWN,
+			LogDebugTLS(TLS_UNKNOWN,
 				    "%s : %s [Operation successful]", prefix,
 				    str);
 		}
@@ -957,14 +978,14 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 	/* Read/Write operations */
 	if (where & SSL_CB_READ) {
 		prefix = "[READ]";
-		LogDebugTLS(DPP_UNKNOWN, "%s : %s [Reading TLS data]", prefix,
+		LogDebugTLS(TLS_UNKNOWN, "%s : %s [Reading TLS data]", prefix,
 			    str);
 		return;
 	}
 
 	if (where & SSL_CB_WRITE) {
 		prefix = "[WRITE]";
-		LogDebugTLS(DPP_UNKNOWN, "%s : %s [Writing TLS data]", prefix,
+		LogDebugTLS(TLS_UNKNOWN, "%s : %s [Writing TLS data]", prefix,
 			    str);
 		return;
 	}
@@ -972,7 +993,7 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 	/* Accept loop (server-specific) */
 	if (where & SSL_CB_ACCEPT_LOOP) {
 		prefix = "[ACCEPT LOOP]";
-		LogDebugTLS(DPP_UNKNOWN,
+		LogDebugTLS(TLS_UNKNOWN,
 			    "%s : %s [Server accepting connection]", prefix,
 			    str);
 		return;
@@ -981,7 +1002,7 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 	/* Connect loop (client-specific) */
 	if (where & SSL_CB_CONNECT_LOOP) {
 		prefix = "[CONNECT LOOP]";
-		LogDebugTLS(DPP_UNKNOWN, "%s : %s [Client connecting]", prefix,
+		LogDebugTLS(TLS_UNKNOWN, "%s : %s [Client connecting]", prefix,
 			    str);
 		return;
 	}
@@ -1006,5 +1027,5 @@ static void gsh_tls_info_callback(const SSL *ssl, int where, int ret)
 		prefix = "[INFO]";
 	}
 
-	LogWarnTLS(DPP_UNKNOWN, "%s : %s", prefix, str);
+	LogWarnTLS(TLS_UNKNOWN, "%s : %s", prefix, str);
 }

@@ -35,25 +35,30 @@
  */
 
 #include "gsh_tls.h"
+#include "gsh_tls_transport.h"
 
-extern gsh_tls_ctx_t *gsh_tls_ctx_init(int fd);
-extern bool gsh_tls_handshake(gsh_tls_ctx_t *ctx);
-extern int gsh_tls_recv(gsh_tls_ctx_t *ctx, void *buf, size_t len, int flags);
-extern int gsh_tls_send(gsh_tls_ctx_t *ctx, const struct msghdr *msg, int flags);
-extern bool gsh_tls_close(gsh_tls_ctx_t *ctx);
-extern bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
-		                         size_t id_size);
-extern bool gsh_tls_key_update(gsh_tls_ctx_t *ctx);
-extern bool get_tls_type(gsh_tls_ctx_t *ctx);
+gsh_tls_cred_t *g_xprt_cred;
 
+bool xprt_tls_init(const char *cert_file, const char *key_file,
+		   const char *ca_file, const char *ciphers,
+		   const char *min_version, bool ktls, bool debug)
+{
+	g_xprt_cred = gsh_tls_init(cert_file, key_file, ca_file, ciphers,
+				   min_version, ktls, debug);
+	if (g_xprt_cred != NULL)
+		return true;
+	else
+		return false;
+}
 /* Initialize TLS for a transport */
 bool xp_tls_init_impl(SVCXPRT *xprt)
 {
 	int ret;
 
-	LogDebugTLS(DPP_DISPATCH, "xprt:%p fd:%d", xprt, xprt->xp_fd);
+	LogDebugTLS(TLS_DISPATCH, "xprt:%p fd:%" PRId32 , xprt, xprt->xp_fd);
 	if (!xprt || !xprt->xp_tls.tls_enabled) {
-		LogEventTLS(DPP_HANDSHAKE, "TLS not enabled for this transport");
+		LogEventTLS(TLS_HANDSHAKE,
+			    "TLS not enabled for this transport");
 		ret = false;
 		goto out;
 	}
@@ -61,18 +66,19 @@ bool xp_tls_init_impl(SVCXPRT *xprt)
 	pthread_mutex_lock(&(xprt->xp_tls.tls_lock));
 	/* Create TLS context if not already created */
 	if (!xprt->xp_tls.tls_ctx) {
-		xprt->xp_tls.tls_ctx = gsh_tls_ctx_init(xprt->xp_fd);
+		xprt->xp_tls.tls_ctx =
+			gsh_tls_ctx_init(xprt->xp_fd, g_xprt_cred, true);
 		if (!xprt->xp_tls.tls_ctx) {
-			LogCritTLS(DPP_HANDSHAKE,
-				   "Failed to initialize TLS context for fd %d",
-				   xprt->xp_fd);
+			LogCritTLS(TLS_HANDSHAKE,
+				   "Failed to initialize TLS context for fd %"
+				   PRId32 , xprt->xp_fd);
 			ret = false;
 			goto out;
 		}
 	}
 
 	if (xprt->xp_tls.tls_established) {
-		LogDebugTLS(DPP_HANDSHAKE,
+		LogDebugTLS(TLS_HANDSHAKE,
 			    "TLS already established for this transport");
 		ret = true;
 		goto out;
@@ -80,29 +86,30 @@ bool xp_tls_init_impl(SVCXPRT *xprt)
 
 	/* Perform TLS handshake */
 	if (!gsh_tls_handshake(xprt->xp_tls.tls_ctx)) {
-		LogWarnTLS(DPP_HANDSHAKE, "TLS handshake failed for fd %d",
-			   xprt->xp_fd);
+		LogWarnTLS(TLS_HANDSHAKE, "TLS handshake failed for fd %"
+			   PRId32 , xprt->xp_fd);
 		ret = false;
 		goto out;
 	}
 
 	xprt->xp_tls.mtls = get_tls_type(xprt->xp_tls.tls_ctx);
-	LogWarnTLS(DPP_HANDSHAKE, "fd %d MTLS:%d",
-					xprt->xp_fd, xprt->xp_tls.mtls);
+	LogWarnTLS(TLS_HANDSHAKE, "fd %" PRId32 " MTLS:%" PRId32 , xprt->xp_fd,
+		   xprt->xp_tls.mtls);
 	/* Verify client certificate */
 	char peer_identity[512];
+
 	if (!gsh_tls_verify_peer(xprt->xp_tls.tls_ctx, peer_identity,
 				 sizeof(peer_identity))) {
-		LogWarnTLS(DPP_HANDSHAKE,
-			   "Client certificate verification failed for fd %d",
-			   xprt->xp_fd);
+		LogWarnTLS(TLS_HANDSHAKE,
+			   "Client certificate verification failed for fd %"
+			   PRId32 , xprt->xp_fd);
 		ret = false;
 		goto out;
 	}
 
 	xprt->xp_tls.tls_established = true;
-	LogEventTLS(DPP_HANDSHAKE,
-		    "TLS connection established for fd %d, ", xprt->xp_fd);
+	LogEventTLS(TLS_HANDSHAKE, "TLS connection established for fd %" PRId32
+		    , xprt->xp_fd);
 
 	ret = true;
 out:
@@ -114,9 +121,10 @@ out:
 int xp_tls_recv_impl(SVCXPRT *xprt, void *buf, size_t len, int flags)
 {
 	int ret;
-	LogDebugTLS(DPP_DISPATCH, "xprt:%p fd:%d", xprt, xprt->xp_fd);
+
+	LogDebugTLS(TLS_DISPATCH, "xprt:%p fd:%" PRId32 , xprt, xprt->xp_fd);
 	if (!xprt || !xprt->xp_tls.tls_ctx || !buf || len <= 0) {
-		LogDebugTLS(DPP_DISPATCH, "Invalid TLS context for recv");
+		LogDebugTLS(TLS_DISPATCH, "Invalid TLS context for recv");
 		return -1;
 	}
 
@@ -124,8 +132,8 @@ int xp_tls_recv_impl(SVCXPRT *xprt, void *buf, size_t len, int flags)
 	ret = gsh_tls_recv(xprt->xp_tls.tls_ctx, buf, len, flags);
 	pthread_mutex_unlock(&(xprt->xp_tls.tls_lock));
 
-	if (GSH_SESSION_CLOSED_ADRUPTLY == ret) {
-		LogWarnTLS(DPP_DISPATCH, "Session Closed adruptly");
+	if (ret == GSH_SESSION_CLOSED_ADRUPTLY) {
+		LogWarnTLS(TLS_DISPATCH, "Session Closed adruptly");
 		return -1;
 	}
 	return ret;
@@ -135,10 +143,11 @@ int xp_tls_recv_impl(SVCXPRT *xprt, void *buf, size_t len, int flags)
 int xp_tls_send_impl(SVCXPRT *xprt, const struct msghdr *msg, int flags)
 {
 	int ret = 0;
-	LogDebugTLS(DPP_DISPATCH, "xprt:%p fd:%d", xprt, xprt->xp_fd);
+
+	LogDebugTLS(TLS_DISPATCH, "xprt:%p fd:%" PRId32 , xprt, xprt->xp_fd);
 	if (!xprt || !xprt->xp_tls.tls_ctx || !msg || !msg->msg_iov ||
 	    msg->msg_iovlen <= 0) {
-		LogDebugTLS(DPP_DISPATCH, "Invalid TLS context for send");
+		LogDebugTLS(TLS_DISPATCH, "Invalid TLS context for send");
 		return -1;
 	}
 
@@ -146,8 +155,8 @@ int xp_tls_send_impl(SVCXPRT *xprt, const struct msghdr *msg, int flags)
 	ret = gsh_tls_send(xprt->xp_tls.tls_ctx, msg, flags);
 	pthread_mutex_unlock(&(xprt->xp_tls.tls_lock));
 
-	if (GSH_SESSION_CLOSED_ADRUPTLY == ret) {
-		LogWarnTLS(DPP_DISPATCH, "Session Closed adruptly");
+	if (ret == GSH_SESSION_CLOSED_ADRUPTLY) {
+		LogWarnTLS(TLS_DISPATCH, "Session Closed adruptly");
 		return -1;
 	}
 
@@ -155,15 +164,12 @@ int xp_tls_send_impl(SVCXPRT *xprt, const struct msghdr *msg, int flags)
 }
 
 /* Reset the TLS specific data in xprt */
-void svc_tls_reset_xprt(SVCXPRT *xprt)
+void xp_tls_reset_xprt(SVCXPRT *xprt)
 {
-	xprt->xp_ops->xp_tls_recv = NULL;
-	xprt->xp_ops->xp_tls_send = NULL;
-	xprt->xp_ops->xp_tls_close = NULL;
 	xprt->xp_tls.tls_enabled = false;
 	xprt->xp_tls.tls_ctx = NULL;
 	xprt->xp_tls.tls_established = false;
-	xprt->xp_tls.mtls =false;
+	xprt->xp_tls.mtls = false;
 	xprt->xp_tls.not_first_packet = false;
 }
 
@@ -173,36 +179,22 @@ void xp_tls_close_impl(SVCXPRT *xprt)
 	if (!xprt || !xprt->xp_tls.tls_ctx) {
 		return; /* Nothing to close */
 	}
-	LogDebugTLS(DPP_DISPATCH, "xprt:%p fd:%d", xprt, xprt->xp_fd);
+	LogDebugTLS(TLS_DISPATCH, "xprt:%p fd:%" PRId32 , xprt, xprt->xp_fd);
 	pthread_mutex_lock(&(xprt->xp_tls.tls_lock));
 	gsh_tls_close(xprt->xp_tls.tls_ctx);
-	svc_tls_reset_xprt(xprt);
+	xp_tls_reset_xprt(xprt);
 	pthread_mutex_unlock(&(xprt->xp_tls.tls_lock));
-	return;
 }
-
-/* Export TLS transport operations */
-struct xp_ops_tls {
-	int (*xp_tls_recv)(SVCXPRT *, void *, size_t, int flags);
-	int (*xp_tls_send)(SVCXPRT *, const struct msghdr *msg, int flags);
-	void (*xp_tls_close)(SVCXPRT *);
-} xp_ops_tls = { .xp_tls_recv = xp_tls_recv_impl,
-		 .xp_tls_send = xp_tls_send_impl,
-		 .xp_tls_close = xp_tls_close_impl };
-
 
 /* Initialize TLS operations for a transport */
 bool svc_tls_init_xprt(SVCXPRT *xprt)
 {
 	bool ret = false;
+
 	if (!xprt) {
 		return ret;
 	}
-	LogEventTLS(DPP_HANDSHAKE, "xprt:%p fd:%d", xprt, xprt->xp_fd);
-	xprt->xp_ops->xp_tls_recv = xp_ops_tls.xp_tls_recv;
-	xprt->xp_ops->xp_tls_send = xp_ops_tls.xp_tls_send;
-	xprt->xp_ops->xp_tls_close = xp_ops_tls.xp_tls_close;
-
+	LogEventTLS(TLS_HANDSHAKE, "xprt:%p fd:%" PRId32 , xprt, xprt->xp_fd);
 	/* Initialize TLS structure */
 	pthread_mutex_init(&(xprt->xp_tls.tls_lock), NULL);
 	xprt->xp_tls.tls_enabled = true;
@@ -211,20 +203,22 @@ bool svc_tls_init_xprt(SVCXPRT *xprt)
 
 	ret = xp_tls_init_impl(xprt);
 	if (ret == false) {
-		svc_tls_reset_xprt(xprt);
-		LogEventTLS(DPP_HANDSHAKE, "TLS disabled xprt:%p fd:%d", xprt, xprt->xp_fd);
+		xp_tls_reset_xprt(xprt);
+		LogEventTLS(TLS_HANDSHAKE, "TLS disabled xprt:%p fd:%" PRId32 ,
+			    xprt, xprt->xp_fd);
 
 	} else {
-		LogEventTLS(DPP_HANDSHAKE, "TLS enabled xprt:%p fd:%d", xprt, xprt->xp_fd);
+		LogEventTLS(TLS_HANDSHAKE, "TLS enabled xprt:%p fd:%" PRId32 ,
+			    xprt, xprt->xp_fd);
 	}
 	return ret;
 }
 
-static inline bool is_tls_clienthello(SVCXPRT *xprt)
+bool is_tls_clienthello(int fd)
 {
 	unsigned char peek_buf[5];
-	ssize_t n = recv(xprt->xp_fd, peek_buf, sizeof(peek_buf), MSG_PEEK);
-	bool ret = false;
+	ssize_t n = recv(fd, peek_buf, sizeof(peek_buf), MSG_PEEK);
+
 	if (n < 5)
 		return false;
 
@@ -232,12 +226,14 @@ static inline bool is_tls_clienthello(SVCXPRT *xprt)
 	if (peek_buf[0] == 0x16 && peek_buf[1] == 0x03 &&
 	    (peek_buf[2] == 0x01 || peek_buf[2] == 0x03 ||
 	     peek_buf[2] == 0x04)) {
-		ret = svc_tls_init_xprt(xprt);
+		return true;
 	}
-	return ret;
+	return false;
 }
 
 bool is_handshake_msg(SVCXPRT *xprt)
 {
-	return is_tls_clienthello(xprt);
+	if (is_tls_clienthello(xprt->xp_fd))
+		return svc_tls_init_xprt(xprt);
+	return false;
 }

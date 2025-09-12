@@ -26,7 +26,7 @@
 /**
  * @file gsh_tls_gnutls.c
  * @brief Routines used for managing the TLS Session using GnuTLS lib.
- * Implementation patterns have been derived from gnuTLS library
+ * Implementation patterns have been derived from GNUTLS library
  * especially from server.c patterns
  *
  * Routines used for entertaining TLS in NFS-Ganesha.
@@ -36,8 +36,7 @@
 #include "gsh_tls.h"
 
 /* Global GnuTLS context */
-static gnutls_certificate_credentials_t global_creds = NULL;
-static gnutls_priority_t global_priority = NULL;
+static gnutls_priority_t global_priority;
 static void gsh_tls_enhanced_debug_callback(int level, const char *str);
 static int gsh_tls_verify_certificate(gnutls_session_t session);
 /* Helper function to get GnuTLS error string */
@@ -53,24 +52,29 @@ static char *get_gnutls_error(int error_code)
  *
  * @param cert_file    Path to the server certificate file (PEM format)
  * @param key_file     Path to the server private key file (PEM format)
- * @param ca_file      Path to the CA certificate file (PEM format) for client verification
+ * @param ca_file      Path to the CA certificate file (PEM format) for
+ *			client verification
  * @param ciphers      Cipher suite string (GnuTLS priority string)
  * @param min_version  Minimum TLS version ("TLSv1.2" or "TLSv1.3")
  * @param ktls         To enable or disable ktls
- * @param debug        To enable or disable debugging including registering lib callbacks
- * @return             true on success, false on failure
+ * @param debug        To enable or disable debugging including registering
+ *			lib callbacks
+ * @return             Creds which should be used for per session connection
+ *			creation, if fails returns NULL.
  */
-bool gsh_tls_init(const char *cert_file, const char *key_file,
-		  const char *ca_file, const char *ciphers,
-		  const char *min_version, bool ktls, bool debug)
+gsh_tls_cred_t *gsh_tls_init(const char *cert_file, const char *key_file,
+			     const char *ca_file, const char *ciphers,
+			     const char *min_version, bool ktls, bool debug)
 {
 	int ret;
-	LogDebugTLS(DPP_DISPATCH, "%s:%d", __func__, __LINE__);
+
+	LogDebugTLS(TLS_DISPATCH, "%s:%" PRId32 , __func__, __LINE__);
 	char priority_str[MAX_PRIORITY_STR] = { 0 };
+	gnutls_certificate_credentials_t global_creds = NULL;
 	/* Initialize GnuTLS */
 	ret = gnutls_global_init();
 	if (ret < 0) {
-		LogCritTLS(DPP_INIT, "Failed to initialize GnuTLS: %s",
+		LogCritTLS(TLS_INIT, "Failed to initialize GnuTLS: %s",
 			   get_gnutls_error(ret));
 		return false;
 	}
@@ -85,7 +89,7 @@ bool gsh_tls_init(const char *cert_file, const char *key_file,
 	/* Initialize certificate credentials */
 	ret = gnutls_certificate_allocate_credentials(&global_creds);
 	if (ret < 0) {
-		LogCritTLS(DPP_INIT, "Failed to allocate credentials: %s",
+		LogCritTLS(TLS_INIT, "Failed to allocate credentials: %s",
 			   get_gnutls_error(ret));
 		goto cleanup_global;
 	}
@@ -95,7 +99,7 @@ bool gsh_tls_init(const char *cert_file, const char *key_file,
 		ret = gnutls_certificate_set_x509_trust_file(
 			global_creds, ca_file, GNUTLS_X509_FMT_PEM);
 		if (ret < 0) {
-			LogCritTLS(DPP_INIT, "Failed to load CA file %s: %s",
+			LogCritTLS(TLS_INIT, "Failed to load CA file %s: %s",
 				   ca_file, get_gnutls_error(ret));
 			goto cleanup_global;
 		}
@@ -103,7 +107,7 @@ bool gsh_tls_init(const char *cert_file, const char *key_file,
 		/* Use default system CA certificates */
 		ret = gnutls_certificate_set_x509_system_trust(global_creds);
 		if (ret < 0) {
-			LogWarnTLS(DPP_INIT,
+			LogWarnTLS(TLS_INIT,
 				   "Failed to set default system trust: %s",
 				   get_gnutls_error(ret));
 			goto cleanup_global;
@@ -115,7 +119,7 @@ bool gsh_tls_init(const char *cert_file, const char *key_file,
 						   key_file,
 						   GNUTLS_X509_FMT_PEM);
 	if (ret < 0) {
-		LogCritTLS(DPP_INIT, "Failed to load certificate/key files: %s",
+		LogCritTLS(TLS_INIT, "Failed to load certificate/key files: %s",
 			   get_gnutls_error(ret));
 		goto cleanup_creds;
 	}
@@ -132,10 +136,10 @@ bool gsh_tls_init(const char *cert_file, const char *key_file,
 		strncat(priority_str, ciphers,
 			MAX_PRIORITY_STR - strlen(priority_str) - 1);
 	}
-	LogDebugTLS(DPP_INIT, "Setting priority: %s", priority_str);
+	LogDebugTLS(TLS_INIT, "Setting priority: %s", priority_str);
 	ret = gnutls_priority_init(&global_priority, priority_str, NULL);
 	if (ret < 0) {
-		LogCritTLS(DPP_INIT, "Failed to set priority: %s",
+		LogCritTLS(TLS_INIT, "Failed to set priority: %s",
 			   get_gnutls_error(ret));
 		goto cleanup_creds;
 	}
@@ -146,36 +150,39 @@ bool gsh_tls_init(const char *cert_file, const char *key_file,
 			global_creds, gsh_tls_verify_certificate);
 	}
 
-	LogDebugTLS(DPP_INIT, "TLS initialized successfully with GnuTLS");
-	return true;
+	LogDebugTLS(TLS_INIT, "TLS initialized successfully with GnuTLS");
+	return global_creds;
 
 cleanup_creds:
 	gnutls_certificate_free_credentials(global_creds);
 cleanup_global:
 	gnutls_global_deinit();
-	return false;
+	return NULL;
 }
 
 /**
  * Create a new TLS context for a socket
  *
  * @param fd           Socket file descriptor
+ * @param cred         creds which got returned from gsh_tls_init()
+ * @param is_server    Connection type i.e fd is acting as server or a client.
  * @return             Pointer to the new TLS context, or NULL on failure
  */
-gsh_tls_ctx_t *gsh_tls_ctx_init(int fd)
+gsh_tls_ctx_t *gsh_tls_ctx_init(int fd, gsh_tls_cred_t *creds, bool is_server)
 {
 	gsh_tls_ctx_t *ctx;
 	int ret;
-	LogDebugTLS(DPP_HANDSHAKE, "%s:%d", __func__, __LINE__);
 
-	if (!global_creds) {
-		LogCritTLS(DPP_HANDSHAKE, "TLS not initialized");
+	LogDebugTLS(TLS_HANDSHAKE, "%s:%" PRId32 , __func__, __LINE__);
+
+	if (!creds) {
+		LogCritTLS(TLS_HANDSHAKE, "TLS not initialized");
 		return NULL;
 	}
 
 	ctx = calloc(1, sizeof(gsh_tls_ctx_t));
 	if (!ctx) {
-		LogCritTLS(DPP_HANDSHAKE, "Failed to allocate TLS context");
+		LogCritTLS(TLS_HANDSHAKE, "Failed to allocate TLS context");
 		return NULL;
 	}
 
@@ -183,9 +190,13 @@ gsh_tls_ctx_t *gsh_tls_ctx_init(int fd)
 	ctx->fd = fd;
 
 	/* Initialize session */
-	ret = gnutls_init(&ctx->session, GNUTLS_SERVER);
+	if (is_server) {
+		ret = gnutls_init(&ctx->session, GNUTLS_SERVER);
+	} else {
+		ret = gnutls_init(&ctx->session, GNUTLS_CLIENT);
+	}
 	if (ret < 0) {
-		LogCritTLS(DPP_HANDSHAKE,
+		LogCritTLS(TLS_HANDSHAKE,
 			   "Failed to initialize GnuTLS session: %s",
 			   get_gnutls_error(ret));
 		free(ctx);
@@ -196,9 +207,9 @@ gsh_tls_ctx_t *gsh_tls_ctx_init(int fd)
 
 	/* Set credentials */
 	ret = gnutls_credentials_set(ctx->session, GNUTLS_CRD_CERTIFICATE,
-				     global_creds);
+				     creds);
 	if (ret < 0) {
-		LogCritTLS(DPP_HANDSHAKE, "Failed to set credentials: %s",
+		LogCritTLS(TLS_HANDSHAKE, "Failed to set credentials: %s",
 			   get_gnutls_error(ret));
 		gnutls_deinit(ctx->session);
 		free(ctx);
@@ -208,17 +219,15 @@ gsh_tls_ctx_t *gsh_tls_ctx_init(int fd)
 	/* Set priority */
 	ret = gnutls_priority_set(ctx->session, global_priority);
 	if (ret < 0) {
-		LogCritTLS(DPP_HANDSHAKE, "Failed to set priority: %s",
+		LogCritTLS(TLS_HANDSHAKE, "Failed to set priority: %s",
 			   get_gnutls_error(ret));
 		gnutls_deinit(ctx->session);
 		free(ctx);
 		return NULL;
 	}
-
-	gnutls_certificate_server_set_request(ctx->session, GNUTLS_CERT_REQUEST);
-
-	/* Set default timeout for handshake */
-	gnutls_handshake_set_timeout(ctx->session, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
+	if (is_server)
+		gnutls_certificate_server_set_request(ctx->session,
+						      GNUTLS_CERT_REQUEST);
 
 	return ctx;
 }
@@ -232,13 +241,15 @@ gsh_tls_ctx_t *gsh_tls_ctx_init(int fd)
 bool gsh_tls_handshake(gsh_tls_ctx_t *ctx)
 {
 	int ret;
-	LogDebugTLS(DPP_HANDSHAKE, "%s:%d", __func__, __LINE__);
+
+	LogDebugTLS(TLS_HANDSHAKE, "%s:%" PRId32 , __func__, __LINE__);
 	gnutls_datum_t out;
 	int type;
-	unsigned status;
+	unsigned int status;
 	int counter = 0;
+
 	if (!ctx || !ctx->session) {
-		LogCritTLS(DPP_HANDSHAKE, "Invalid TLS context");
+		LogCritTLS(TLS_HANDSHAKE, "Invalid TLS context");
 		return false;
 	}
 
@@ -255,19 +266,19 @@ bool gsh_tls_handshake(gsh_tls_ctx_t *ctx)
 	/* Perform server handshake */
 retry:
 	do {
-		LogDebugTLS(DPP_HANDSHAKE, "trying Handhake ");
+		LogDebugTLS(TLS_HANDSHAKE, "trying Handhake ");
 		ret = gnutls_handshake(ctx->session);
 		++counter;
 	} while (ret < 0 && gnutls_error_is_fatal(ret) == 0);
 
 	if (ret < 0) {
-		LogEventTLS(DPP_HANDSHAKE, "*** Handshake failed: :%d %s\n",
-			    ret, gnutls_strerror(ret));
+		LogEventTLS(TLS_HANDSHAKE, "*** Handshake failed: :%" PRId32
+			    " %s\n", ret, gnutls_strerror(ret));
 		switch (ret) {
 		case GNUTLS_E_AGAIN:
 		case GNUTLS_E_INTERRUPTED:
 			/* Handshake needs more data, not an error */
-			LogDebugTLS(DPP_HANDSHAKE, "Need more data: %s",
+			LogDebugTLS(TLS_HANDSHAKE, "Need more data: %s",
 				    get_gnutls_error(ret));
 			goto retry;
 
@@ -279,18 +290,18 @@ retry:
 			gnutls_certificate_verification_status_print(status,
 								     type, &out,
 								     0);
-			LogDebugTLS(DPP_HANDSHAKE, "cert verify output: %s\n",
+			LogDebugTLS(TLS_HANDSHAKE, "cert verify output: %s\n",
 				    out.data);
 			gnutls_free(out.data);
 			break;
 
 		case GNUTLS_E_FATAL_ALERT_RECEIVED:
-			LogDebugTLS(DPP_HANDSHAKE,
+			LogDebugTLS(TLS_HANDSHAKE,
 				    "TLS fatal alert received on fd ");
 			break;
 
 		default:
-			LogDebugTLS(DPP_HANDSHAKE,
+			LogDebugTLS(TLS_HANDSHAKE,
 				    "TLS Error <NOT HANDLED> :%s",
 				    gnutls_strerror(ret));
 			break;
@@ -306,14 +317,14 @@ retry:
 
 	ret = gnutls_server_name_get(ctx->session, name, &name_len, &type, 0);
 	if (ret == 0 && type == GNUTLS_NAME_DNS) {
-		LogDebugTLS(DPP_HANDSHAKE, "SNI hostname: %s\n", name);
+		LogDebugTLS(TLS_HANDSHAKE, "SNI hostname: %s", name);
 	} else {
-		LogDebugTLS(DPP_HANDSHAKE, "No SNI hostname received\n");
+		LogDebugTLS(TLS_HANDSHAKE, "No SNI hostname received");
 	}
 
 	ret = true;
 	pthread_mutex_unlock(&(ctx->ctx_lock));
-	LogDebugTLS(DPP_HANDSHAKE, "TLS handshake done");
+	LogDebugTLS(TLS_HANDSHAKE, "TLS handshake done");
 	return ret;
 }
 
@@ -325,26 +336,29 @@ retry:
  */
 bool get_tls_type(gsh_tls_ctx_t *ctx)
 {
-    unsigned int cert_list_size = 0;
-    const gnutls_datum_t *cert_list;
-    bool ret = false;
-    if (!ctx->session)
-        return ret;
+	unsigned int cert_list_size = 0;
+	const gnutls_datum_t *cert_list;
+	bool ret = false;
 
-    cert_list = gnutls_certificate_get_peers(ctx->session, &cert_list_size);
+	if (!ctx->session)
+		return ret;
 
-    if (cert_list && cert_list_size > 0) {
-        unsigned int status = 0;
-	ret = gnutls_certificate_verify_peers3(ctx->session, NULL, &status);
+	cert_list = gnutls_certificate_get_peers(ctx->session, &cert_list_size);
 
-        if (ret == 0 && status == 0) {
-		ret = true;
-        } else {
-		ret = false;
+	if (cert_list && cert_list_size > 0) {
+		unsigned int status = 0;
+
+		ret = gnutls_certificate_verify_peers3(ctx->session, NULL,
+						       &status);
+
+		if (ret == 0 && status == 0) {
+			ret = true;
+		} else {
+			ret = false;
+		}
 	}
-    }
-    LogDebugTLS(DPP_HANDSHAKE, "MTLS CERIFICATE %d", ret);
-    return ret;
+	LogDebugTLS(TLS_HANDSHAKE, "MTLS CERIFICATE %" PRId32 , ret);
+	return ret;
 }
 
 /**
@@ -366,24 +380,26 @@ static int gsh_tls_verify_certificate(gnutls_session_t session)
 	/* Get peer certificate list */
 	cert_list = gnutls_certificate_get_peers(session, &cert_list_size);
 	if (cert_list == NULL || cert_list_size == 0) {
-		LogDebugTLS(DPP_HANDSHAKE, "No client certificate provided");
-		return GNUTLS_E_SUCCESS; /* Allow connections without client certs */
+		LogDebugTLS(TLS_HANDSHAKE, "No client certificate provided");
+		 /*  Allow connections without client certs */
+		return GNUTLS_E_SUCCESS;
 	}
 
 	/* Verify certificate chain */
 	ret = gnutls_certificate_verify_peers3(session, NULL, &status);
 	if (ret < 0) {
-		LogWarnTLS(DPP_HANDSHAKE, "Certificate verification failed: %s",
+		LogWarnTLS(TLS_HANDSHAKE, "Certificate verification failed: %s",
 			   gnutls_strerror(ret));
 		return GNUTLS_E_CERTIFICATE_ERROR;
 	}
 
 	if (status != 0) {
 		gnutls_datum_t out;
+
 		gnutls_certificate_verification_status_print(status,
 							     GNUTLS_CRT_X509,
 							     &out, 0);
-		LogWarnTLS(DPP_HANDSHAKE, "Certificate verification failed: %s",
+		LogWarnTLS(TLS_HANDSHAKE, "Certificate verification failed: %s",
 			   out.data);
 		gnutls_free(out.data);
 		return GNUTLS_E_CERTIFICATE_ERROR;
@@ -392,7 +408,7 @@ static int gsh_tls_verify_certificate(gnutls_session_t session)
 	/* Initialize certificate */
 	ret = gnutls_x509_crt_init(&cert);
 	if (ret < 0) {
-		LogWarnTLS(DPP_INIT, "Failed to initialize certificate: %s",
+		LogWarnTLS(TLS_INIT, "Failed to initialize certificate: %s",
 			   gnutls_strerror(ret));
 		return GNUTLS_E_CERTIFICATE_ERROR;
 	}
@@ -400,7 +416,7 @@ static int gsh_tls_verify_certificate(gnutls_session_t session)
 	/* Import certificate */
 	ret = gnutls_x509_crt_import(cert, &cert_list[0], GNUTLS_X509_FMT_DER);
 	if (ret < 0) {
-		LogWarnTLS(DPP_HANDSHAKE, "Failed to import certificate: %s",
+		LogWarnTLS(TLS_HANDSHAKE, "Failed to import certificate: %s",
 			   gnutls_strerror(ret));
 		gnutls_x509_crt_deinit(cert);
 		return GNUTLS_E_CERTIFICATE_ERROR;
@@ -409,13 +425,14 @@ static int gsh_tls_verify_certificate(gnutls_session_t session)
 	/* Log certificate information */
 	char dn[256];
 	size_t dn_size = sizeof(dn);
+
 	ret = gnutls_x509_crt_get_dn(cert, dn, &dn_size);
 	if (ret >= 0) {
-		LogDebugTLS(DPP_HANDSHAKE, "Client certificate DN: %s", dn);
+		LogDebugTLS(TLS_HANDSHAKE, "Client certificate DN: %s", dn);
 	}
 
 	gnutls_x509_crt_deinit(cert);
-	LogDebugTLS(DPP_HANDSHAKE, "Client certificate verified successfully");
+	LogDebugTLS(TLS_HANDSHAKE, "Client certificate verified successfully");
 
 	return GNUTLS_E_SUCCESS;
 }
@@ -438,19 +455,23 @@ int gsh_tls_recv(gsh_tls_ctx_t *ctx, void *buf, size_t len, int flags)
 	bool nonblock = 0;
 	ssize_t offset = 0;
 
+
 	if (!ctx || !ctx->session)
 		return EINVAL;
 
 	if (nonblock)
 		fcntl(fd, F_SETFL, orig_flags | O_NONBLOCK);
 
-	LogDebugTLS(DPP_DISPATCH, "Recv requested len > %d", len);
+	LogDebugTLS(TLS_DISPATCH, "Recv requested len > %" PRId32 , len);
 
 	while (offset < len) {
 retry:
-		ret = gnutls_record_recv(ctx->session, buf + offset, len - offset);
-		LogDebugTLS(DPP_DISPATCH, "Recv requested len >> %d ret:%d ", len, ret);
-		if (ret < 0) {
+		ret = gnutls_record_recv(ctx->session, buf + offset,
+					 len - offset);
+		if (ret <= 0) {
+			LogDebugTLS(TLS_DISPATCH, "Read ret:%" PRId32
+				   " error:%s %" PRId32 ,
+				    ret, get_gnutls_error(ret), errno);
 			switch (ret) {
 			case GNUTLS_E_AGAIN:
 			case GNUTLS_E_INTERRUPTED:
@@ -463,8 +484,6 @@ retry:
 				error_code = GSH_SESSION_UNKNOWN_ERROR;
 				break;
 			}
-			LogDebugTLS(DPP_DISPATCH, "Read ret:%d error:%s %d",
-				    ret, get_gnutls_error(ret), errno);
 			return error_code;
 		}
 		offset += ret;
@@ -472,7 +491,7 @@ retry:
 	if (nonblock)
 		fcntl(fd, F_SETFL, orig_flags); // Restore original flags
 
-	LogDebugTLS(DPP_DISPATCH, "Recv Completed len: %ld", offset);
+	LogDebugTLS(TLS_DISPATCH, "Recv Completed len: %" PRId64 , offset);
 	return offset;
 }
 
@@ -492,6 +511,7 @@ int gsh_tls_send(gsh_tls_ctx_t *ctx, const struct msghdr *msg, int flags)
 	bool nonblock = 0;
 	ssize_t total_sent = 0;
 	int error_code = 0;
+	int ret;
 
 	if (!ctx || !ctx->session)
 		return EINVAL;
@@ -499,7 +519,8 @@ int gsh_tls_send(gsh_tls_ctx_t *ctx, const struct msghdr *msg, int flags)
 	if (nonblock)
 		fcntl(fd, F_SETFL, orig_flags | O_NONBLOCK);
 
-	LogDebugTLS(DPP_DISPATCH, "Send requested len > %d", msg->msg_iovlen);
+	LogDebugTLS(TLS_DISPATCH, "Send requested len > %" PRId32 ,
+		    msg->msg_iovlen);
 	for (int i = 0; i < msg->msg_iovlen; ++i) {
 		const char *buf = msg->msg_iov[i].iov_base;
 		ssize_t len = msg->msg_iov[i].iov_len;
@@ -507,10 +528,13 @@ int gsh_tls_send(gsh_tls_ctx_t *ctx, const struct msghdr *msg, int flags)
 
 retry:
 		while (offset < len) {
-			int ret = gnutls_record_send(ctx->session, buf + offset,
+			ret = gnutls_record_send(ctx->session, buf + offset,
 						     len - offset);
-			LogDebugTLS(DPP_DISPATCH, "Send requested len >> %d ret:%d ", len, ret);
 			if (ret <= 0) {
+				LogDebugTLS(TLS_DISPATCH,
+					    "Write ret:%" PRId32 " error:%s %"
+					    PRId32 , ret,
+					    get_gnutls_error(ret), errno);
 				switch (ret) {
 				case GNUTLS_E_AGAIN:
 				case GNUTLS_E_INTERRUPTED:
@@ -523,24 +547,17 @@ retry:
 					error_code = GSH_SESSION_UNKNOWN_ERROR;
 					break;
 				}
-				LogDebugTLS(DPP_DISPATCH,
-					    "Write ret:%d error:%s %d", ret,
-					    get_gnutls_error(ret), errno);
-				goto out;
+				return error_code;
 			}
 			offset += ret;
 			total_sent += ret;
 		}
 	}
 
-out:
 	if (nonblock)
 		fcntl(fd, F_SETFL, orig_flags); // Restore original flags
 
-	if (error_code != 0)
-		return error_code;
-
-	LogDebugTLS(DPP_DISPATCH, "Send Completed len: %ld", total_sent);
+	LogDebugTLS(TLS_DISPATCH, "Send Completed len: %" PRId64 , total_sent);
 	return total_sent;
 }
 
@@ -552,7 +569,7 @@ out:
  */
 bool gsh_tls_close(gsh_tls_ctx_t *ctx)
 {
-	LogDebugTLS(DPP_SHUTDOWN, "ctx:%p", ctx);
+	LogDebugTLS(TLS_SHUTDOWN, "ctx:%p", ctx);
 
 	if (!ctx) {
 		return true;
@@ -564,7 +581,7 @@ bool gsh_tls_close(gsh_tls_ctx_t *ctx)
 		gnutls_deinit(ctx->session);
 	}
 
-	LogDebugTLS(DPP_SHUTDOWN, "freeing ctx");
+	LogDebugTLS(TLS_SHUTDOWN, "freeing ctx");
 	free(ctx);
 	return true;
 }
@@ -582,20 +599,22 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 {
 	unsigned int status;
 	int ret;
-	LogDebugTLS(DPP_HANDSHAKE, "%s:%d", __func__, __LINE__);
+
+	LogDebugTLS(TLS_HANDSHAKE, "%s:%" PRId32 , __func__, __LINE__);
 
 	if (!ctx || !ctx->session) {
-		LogCritTLS(DPP_HANDSHAKE, "Invalid TLS context");
+		LogCritTLS(TLS_HANDSHAKE, "Invalid TLS context");
 		return false;
 	}
 
 	/* Check if client provided a certificate */
 	const gnutls_datum_t *cert_list;
 	unsigned int cert_list_size;
+
 	cert_list = gnutls_certificate_get_peers(ctx->session, &cert_list_size);
 
 	if (cert_list == NULL || cert_list_size == 0) {
-		LogDebugTLS(DPP_HANDSHAKE,
+		LogDebugTLS(TLS_HANDSHAKE,
 			    "Client did not provide a certificate");
 		if (peer_identity && id_size > 0)
 			strlcpy(peer_identity, "anonymous", id_size);
@@ -605,24 +624,24 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 	/* Verify certificate */
 	ret = gnutls_certificate_verify_peers2(ctx->session, &status);
 	if (ret < 0) {
-		LogWarnTLS(DPP_HANDSHAKE, "Certificate verification failed: %s",
+		LogWarnTLS(TLS_HANDSHAKE, "Certificate verification failed: %s",
 			   get_gnutls_error(ret));
 		return false;
 	}
 
 	if (status != 0) {
 		gnutls_datum_t out;
+
 		ret = gnutls_certificate_verification_status_print(
 			status, GNUTLS_CRT_X509, &out, 0);
 		if (ret == 0) {
-			LogWarnTLS(DPP_HANDSHAKE,
+			LogWarnTLS(TLS_HANDSHAKE,
 				   "Client certificate verification failed: %s",
 				   out.data);
 			gnutls_free(out.data);
 		} else {
-			LogWarnTLS(
-				DPP_HANDSHAKE,
-				"Client certificate verification failed with status: %u",
+			LogWarnTLS(TLS_HANDSHAKE,
+				"Client certificate verification failed with status: %" PRIu32 ,
 				status);
 		}
 		return false;
@@ -630,9 +649,10 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 
 	/* Extract Common Name from certificate */
 	gnutls_x509_crt_t cert;
+
 	ret = gnutls_x509_crt_init(&cert);
 	if (ret < 0) {
-		LogWarnTLS(DPP_HANDSHAKE,
+		LogWarnTLS(TLS_HANDSHAKE,
 			   "Failed to initialize certificate structure: %s",
 			   get_gnutls_error(ret));
 		return false;
@@ -640,7 +660,7 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 
 	ret = gnutls_x509_crt_import(cert, &cert_list[0], GNUTLS_X509_FMT_DER);
 	if (ret < 0) {
-		LogWarnTLS(DPP_HANDSHAKE, "Failed to import certificate: %s",
+		LogWarnTLS(TLS_HANDSHAKE, "Failed to import certificate: %s",
 			   get_gnutls_error(ret));
 		gnutls_x509_crt_deinit(cert);
 		return false;
@@ -649,10 +669,11 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 	/* Get the common name */
 	char buf[256];
 	size_t buf_size = sizeof(buf);
+
 	ret = gnutls_x509_crt_get_dn_by_oid(cert, GNUTLS_OID_X520_COMMON_NAME,
 					    0, 0, buf, &buf_size);
 	if (ret < 0) {
-		LogWarnTLS(DPP_HANDSHAKE,
+		LogWarnTLS(TLS_HANDSHAKE,
 			   "Could not get CN from client certificate: %s",
 			   get_gnutls_error(ret));
 		gnutls_x509_crt_deinit(cert);
@@ -664,7 +685,7 @@ bool gsh_tls_verify_peer(gsh_tls_ctx_t *ctx, char *peer_identity,
 		strlcpy(peer_identity, buf, id_size);
 	}
 
-	LogDebugTLS(DPP_HANDSHAKE,
+	LogDebugTLS(TLS_HANDSHAKE,
 		    "Client authenticated with certificate CN: %s", buf);
 	gnutls_x509_crt_deinit(cert);
 	return true;
@@ -686,41 +707,44 @@ bool gsh_tls_key_update(gsh_tls_ctx_t *ctx)
 	int ret;
 
 	if (!ctx || !ctx->session) {
-		LogWarnTLS(DPP_HANDSHAKE, "Invalid ctx\n");
+		LogWarnTLS(TLS_HANDSHAKE, "Invalid ctx\n");
 		return false;
 	}
 
 	/* Check if we're using TLS 1.3, which supports key updates */
 	gnutls_protocol_t version = gnutls_protocol_get_version(ctx->session);
+
 	if (version != GNUTLS_TLS1_3) {
-		LogWarnTLS(DPP_HANDSHAKE,
+		LogWarnTLS(TLS_HANDSHAKE,
 			   "Key update is only supported in TLS 1.3\n");
 		return false;
 	}
 
 	/* Request key update */
 	ret = gnutls_session_key_update(ctx->session, GNUTLS_KU_PEER);
-        if (ret < 0) {
-        	LogWarnTLS(DPP_INIT, "gnutls_session_key_update failed: %s\n",
-                get_gnutls_error(ret));
-	        return false;
-        }
+	if (ret < 0) {
+		LogWarnTLS(TLS_INIT, "gnutls_session_key_update failed: %s\n",
+			   get_gnutls_error(ret));
+		return false;
+	}
 
-	LogWarnTLS(DPP_HANDSHAKE, "Key update requested and completed.\n");
+	LogWarnTLS(TLS_HANDSHAKE, "Key update requested and completed.\n");
 	return true;
 }
 
-/*debug callback registered with lib to get detailed o/p of whats happening */
+/*Debug callback registered with lib to get detailed o/p of whats happening */
 static void gsh_tls_enhanced_debug_callback(int level, const char *str)
 {
 	const char *prefix = "";
-	static int handshake_in_progress = 0;
-	static int session_resumed = 0;
+	static int handshake_in_progress;
+	static int session_resumed;
 
 	/* Remove trailing newlines and whitespace */
 	char *clean_str = strdup(str);
+
 	if (clean_str) {
 		size_t len = strlen(clean_str);
+
 		while (len > 0 && (clean_str[len - 1] == '\n' ||
 				   clean_str[len - 1] == '\r' ||
 				   clean_str[len - 1] == ' ' ||
@@ -836,7 +860,7 @@ static void gsh_tls_enhanced_debug_callback(int level, const char *str)
 		else if (strstr(clean_str, "no_renegotiation"))
 			desc = "no_renegotiation";
 
-		LogWarnTLS(DPP_INIT, "[ALERT] %s: level=%s, desc=%s (%s)", dir,
+		LogWarnTLS(TLS_INIT, "[ALERT] %s: level=%s, desc=%s (%s)", dir,
 			   level_str, desc, clean_str);
 		free(clean_str);
 		return;
@@ -967,7 +991,7 @@ static void gsh_tls_enhanced_debug_callback(int level, const char *str)
 	}
 
 	/* Log the message with appropriate prefix */
-	LogWarnTLS(DPP_UNKNOWN, "%s : %s", prefix, clean_str);
+	LogWarnTLS(TLS_UNKNOWN, "%s : %s", prefix, clean_str);
 
 	free(clean_str);
 }

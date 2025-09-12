@@ -1,8 +1,9 @@
-# SPDX-License-Identifier: BSD-3-Clause
-#-------------------------------------------------------------------------------
+# SPDX-License-Identifier: LGPL-3.0-or-later
 #
-# Copyright Panasas, 2023
-# Contributor: Your Name <your.email@example.com>
+# vim:noexpandtab:shiftwidth=8:tabstop=8:
+#
+# Copyright (C) 2025, IBM . All rights reserved.
+# Author: Deeraj Patil <deeraj.patil@ibm.com>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -16,7 +17,8 @@
 #
 # You should have received a copy of the GNU Lesser General Public
 # License along with this library; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+# 02110-1301 USA.  see <http://www.gnu.org/licenses/
 #
 #-------------------------------------------------------------------------------
 # - Find TLS libraries
@@ -40,7 +42,7 @@ IF(TLS_PREFIX)
     NO_DEFAULT_PATH
   )
 
-  FIND_PROGRAM(GNUTLS_CONFIG NAMES gnutls-config
+  FIND_PROGRAM(GNUTLS_CONFIG NAMES gnutls
     PATHS ${TLS_PREFIX}/bin
     NO_SYSTEM_ENVIRONMENT_PATH
     NO_DEFAULT_PATH
@@ -75,6 +77,7 @@ IF(NOT _openssl_idx EQUAL -1)
     SET(TLS_INCLUDE_DIRS ${OPENSSL_INCLUDE_DIR})
     SET(TLS_LIBRARIES ${OPENSSL_LIBRARIES})
     MESSAGE(STATUS "Using OpenSSL as TLS backend")
+    SET(USE_OPENSSL ON)
   ELSE(OPENSSL_FOUND)
     IF(TLS_FIND_REQUIRED_openssl)
       MESSAGE(FATAL_ERROR "OpenSSL requested but not found")
@@ -86,20 +89,25 @@ ENDIF(NOT _openssl_idx EQUAL -1)
 
 LIST(FIND TLS_FIND_COMPONENTS "gnutls" _gnutls_idx)
 IF(NOT _gnutls_idx EQUAL -1)
-  FIND_PACKAGE(GnuTLS)
-  IF(GNUTLS_FOUND)
-    SET(TLS_FOUND 1)
-    SET(TLS_BACKEND "GNUTLS")
-    SET(TLS_INCLUDE_DIRS ${GNUTLS_INCLUDE_DIRS})
-    SET(TLS_LIBRARIES ${GNUTLS_LIBRARIES})
-    MESSAGE(STATUS "Using GnuTLS as TLS backend")
-  ELSE(GNUTLS_FOUND)
-    IF(TLS_FIND_REQUIRED_gnutls)
-      MESSAGE(FATAL_ERROR "GnuTLS requested but not found")
-    ELSE(TLS_FIND_REQUIRED_gnutls)
-      MESSAGE(WARNING "GnuTLS requested but not found")
-    ENDIF(TLS_FIND_REQUIRED_gnutls)
-  ENDIF(GNUTLS_FOUND)
+  IF(TLS_FOUND)
+    MESSAGE(STATUS "TLS_LIB already found ${TLS_BACKEND}")
+  ELSE(TLS_FOUND)
+    FIND_PACKAGE(GnuTLS)
+    IF(GNUTLS_FOUND)
+      SET(TLS_FOUND 1)
+      SET(TLS_BACKEND "GNUTLS")
+      SET(TLS_INCLUDE_DIRS ${GNUTLS_INCLUDE_DIRS})
+      SET(TLS_LIBRARIES ${GNUTLS_LIBRARIES})
+      MESSAGE(STATUS "Using GnuTLS as TLS backend")
+      SET(USE_GNUTLS ON)
+    ELSE(GNUTLS_FOUND)
+      IF(TLS_FIND_REQUIRED_gnutls)
+        MESSAGE(FATAL_ERROR "GnuTLS requested but not found")
+      ELSE(TLS_FIND_REQUIRED_gnutls)
+        MESSAGE(WARNING "GnuTLS requested but not found")
+      ENDIF(TLS_FIND_REQUIRED_gnutls)
+    ENDIF(GNUTLS_FOUND)
+  ENDIF(TLS_FOUND)
 ENDIF(NOT _gnutls_idx EQUAL -1)
 
 # Report the results

@@ -445,7 +445,6 @@ svc_vc_rendezvous(SVCXPRT *xprt)
  again:
 	len = sizeof(addr);
 	fd = accept(xprt->xp_fd, (struct sockaddr *)(void *)&addr, &len);
-	__warnx(TIRPC_DEBUG_FLAG_SVC_VC, ">>>>>>>New client connected fd %d, ", fd);
 	if (fd < 0) {
 		if (errno == EINTR)
 			goto again;
@@ -612,8 +611,9 @@ svc_vc_destroy_task(struct work_pool_entry *wpe)
 	if (close_fd) {
 #ifdef USE_TLS
 		/*   need to tell the client about TLS Connection closure */
-                if (rec->xprt.xp_ops->xp_tls_close)
-                        rec->xprt.xp_ops->xp_tls_close(&rec->xprt);
+		SVCXPRT *xprt = &rec->xprt;
+
+		SVC_TLS_CLOSE(xprt);
 #endif
 		/* Shutting down without releasing the fd, since
 		 * xp_free_user_data() might be using it */
@@ -1184,7 +1184,8 @@ svc_vc_recv(SVCXPRT *xprt)
 	 * this internally does handshake if this is handshake msg*/
 	if (!((xprt)->xp_tls.not_first_packet)) {
 		if (is_handshake_msg(xprt)) {
-			if (unlikely(svc_rqst_rearm_events(xprt, SVC_XPRT_FLAG_ADDED_RECV))) {
+			if (unlikely(svc_rqst_rearm_events(xprt,
+						SVC_XPRT_FLAG_ADDED_RECV))) {
 				__warnx(TIRPC_DEBUG_FLAG_ERROR,
 						"%s: %p fd %d svc_rqst_rearm_events failed (will set dead)",
 						__func__, xprt, xprt->xp_fd);
@@ -1212,7 +1213,7 @@ svc_vc_recv(SVCXPRT *xprt)
 again:
 #ifdef USE_TLS
 		rlen = SVC_TLS_RECV(xprt, &xd->sx_fbtbc, BYTES_PER_XDR_UNIT,
-		        		hap_again ? MSG_DONTWAIT : MSG_WAITALL);
+				    hap_again ? MSG_DONTWAIT : MSG_WAITALL);
 #else
 		rlen = recv(xprt->xp_fd, &xd->sx_fbtbc, BYTES_PER_XDR_UNIT,
 				    hap_again ? MSG_DONTWAIT : MSG_WAITALL);
@@ -1321,9 +1322,9 @@ again:
 		flags = uv->u.uio_flags;
 	}
 #ifdef USE_TLS
-		rlen = SVC_TLS_RECV(xprt, uv->v.vio_tail, xd->sx_fbtbc,  MSG_DONTWAIT);
+	rlen = SVC_TLS_RECV(xprt, uv->v.vio_tail, xd->sx_fbtbc,  MSG_DONTWAIT);
 #else
-		rlen = recv(xprt->xp_fd, uv->v.vio_tail, xd->sx_fbtbc, MSG_DONTWAIT);
+	rlen = recv(xprt->xp_fd, uv->v.vio_tail, xd->sx_fbtbc, MSG_DONTWAIT);
 #endif
 
 	if (unlikely(rlen < 0)) {

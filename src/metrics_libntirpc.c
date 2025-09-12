@@ -43,8 +43,8 @@ static bool initialized = false;
  * will have the default `0` value in the array. Such entries will not be
  * represented in the metrics array.
  */
-static const uint8_t
-	sec_flavors_idx[] = { [AUTH_NONE] = 1, [AUTH_SYS] = 2, [RPCSEC_GSS] = 3 , [AUTH_TLS] = 4};
+static const uint8_t sec_flavors_idx[] = { [AUTH_NONE] = 1, [AUTH_SYS] = 2,
+					[RPCSEC_GSS] = 3 , [AUTH_TLS] = 4};
 
 /* For each auth-stat as an array index, assign a serial number to be
  * represented as the index in the metrics array.

@@ -27,7 +27,6 @@
  * @file gsh_tls.h
  */
 
-
 #include <fcntl.h>
 #include <errno.h>
 #include "strl.h"
@@ -51,28 +50,29 @@
 #define GSH_SESSION_CLOSED_ADRUPTLY -2
 #define GSH_TLS_HANDSHAKE_FAILED -3
 
-#define DPP_INIT "[Init Path]:"
-#define DPP_DISPATCH "[Dispatch]:"
-#define DPP_HANDSHAKE "[Handshake Path]:"
-#define DPP_SHUTDOWN "[Handshake Path]:"
-#define DPP_UNKNOWN " "
+#define TLS_INIT "[Init Path]:"
+#define TLS_DISPATCH "[Dispatch]:"
+#define TLS_HANDSHAKE "[Handshake Path]:"
+#define TLS_SHUTDOWN "[Handshake Path]:"
+#define TLS_UNKNOWN " "
 
-#define LogCritTLS(component, format, ...)                                   \
-	__warnx(TIRPC_DEBUG_FLAG_ERROR, "[TLS]:%s:%s:%d " format, component, \
-		__func__, __LINE__, ##__VA_ARGS__)
-
-#define LogWarnTLS(component, format, ...)                                  \
-	__warnx(TIRPC_DEBUG_FLAG_WARN, "[TLS]:%s:%s:%d " format, component, \
-		__func__, __LINE__, ##__VA_ARGS__)
-
-#define LogEventTLS(component, format, ...)                                  \
-	__warnx(TIRPC_DEBUG_FLAG_EVENT, "[TLS]:%s:%s:%d " format, component, \
-		__func__, __LINE__, ##__VA_ARGS__)
-
-#define LogDebugTLS(component, format, ...)                                  \
-	if (tls_config.debug) 					\
-		__warnx(TIRPC_DEBUG_FLAG_EVENT, "[TLS]:%s:%s:%d " format,	\
+#define LogCritTLS(component, format, ...)                                 \
+	__warnx(TIRPC_DEBUG_FLAG_ERROR, "[TLS]:%s:%s:%" PRId32 " " format, \
 		component, __func__, __LINE__, ##__VA_ARGS__)
+
+#define LogWarnTLS(component, format, ...)                                \
+	__warnx(TIRPC_DEBUG_FLAG_WARN, "[TLS]:%s:%s:%" PRId32 " " format, \
+		component, __func__, __LINE__, ##__VA_ARGS__)
+
+#define LogEventTLS(component, format, ...)                                \
+	__warnx(TIRPC_DEBUG_FLAG_EVENT, "[TLS]:%s:%s:%" PRId32 " " format, \
+		component, __func__, __LINE__, ##__VA_ARGS__)
+
+#define LogDebugTLS(component, format, ...)                                \
+	if (tls_config.debug)                                              \
+		__warnx(TIRPC_DEBUG_FLAG_EVENT, "[TLS]:%s:%s:%" PRId32 " " \
+			format, component, __func__, __LINE__, ##__VA_ARGS__)
+
 
 /* TLS context structure */
 typedef struct gsh_tls_ctx {
@@ -106,13 +106,13 @@ typedef struct gsh_tls_config {
 	bool debug;
 } gsh_tls_config_t;
 
+#ifdef USE_OPENSSL
+typedef SSL_CTX gsh_tls_cred_t;
+#endif
+
+#ifdef USE_GNUTLS
+typedef struct gnutls_certificate_credentials_st gsh_tls_cred_t;
+#endif
+
 extern gsh_tls_config_t tls_config;
-/*
- * Check the packet is handshake msg
- * NOTE: This is stunnel like TLS handshake request handling
- *       This internally does handshake if this is handshake msg.
- * @param xprt 	       Xprt for which handshake msg needs to be checked.
- * @return             true on handshake msg,
- * 		       false if handshake failed or not handshake msg.
- * */
-bool is_handshake_msg(SVCXPRT *xprt);
+

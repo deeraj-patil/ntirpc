@@ -231,16 +231,19 @@ typedef enum xprt_stat (*svc_req_fun_t) (struct svc_req *);
 
 #ifdef USE_TLS
 struct xp_tls {
-    void *tls_ctx;        /* TLS context */
-    /* Lock to sync between the IO, because lib supports only 16KB packet max in 1 transfer call */
-    pthread_mutex_t tls_lock;
-    /*  If keyupdate needs to be supported based on connection time i.e expire connection after 1hour */
-    time_t last_key_update_time;
-    bool tls_established; /* Is TLS handshake complete */
-    bool tls_enabled;     /* Is TLS enabled for this transport */
-    bool tls_pending;     /* Used in AUTH_TLS handling */
-    bool mtls; 	          /* type of TLS handshake, is mtls is true */
-    bool not_first_packet;/* Used for identifying TLS connectio request which doesnt use AUTH_TLS */
+	void *tls_ctx;        /* TLS context */
+	/* Lock to sync between the IO, because lib supports
+	 * only 16KB packet max in 1 transfer call */
+	pthread_mutex_t tls_lock;
+	/* If keyupdate needs to be supported based on connection time
+	 * i.e expire connection after 1hour */
+	time_t last_key_update_time;
+	bool tls_established; /* Is TLS handshake complete */
+	bool tls_enabled; /* Is TLS enabled for this transport */
+	bool tls_pending; /* Used in AUTH_TLS handling */
+	bool mtls; /* type of TLS handshake, is mtls is true */
+	bool not_first_packet; /* Used for identifying TLS connection request
+				 which doesnt use AUTH_TLS */
 };
 #endif
 
@@ -249,11 +252,6 @@ struct xp_tls {
  */
 struct svc_xprt {
 	struct xp_ops {
-#ifdef USE_TLS
-		int (*xp_tls_recv)(SVCXPRT *, void *, size_t, int flags);
-		int (*xp_tls_send)(SVCXPRT *xprt, const struct msghdr *msg, int flags);
-		void (*xp_tls_close)(SVCXPRT *);
-#endif
 		/** receive incoming requests */
 		svc_xprt_fun_t xp_recv;
 
@@ -472,7 +470,9 @@ __END_DECLS
 	(*(xprt)->xp_ops->xp_recv)(xprt)
 
 #ifdef USE_TLS
-
+int xp_tls_send_impl(SVCXPRT *xprt, const struct msghdr *msg, int flags);
+int xp_tls_recv_impl(SVCXPRT *xprt, void *buf, size_t len, int flags);
+void xp_tls_close_impl(SVCXPRT *xprt);
 /*
  * For stunnel:
  * In svc_recv, code flow checks whether it is a client handshake message.
@@ -492,41 +492,48 @@ __END_DECLS
  * It can also be possible that handshake failed,
  * till that time dont process the data.
  * below While loop will beak if TLS handshake fails or TLS is established.
- * 	so logically no case for infinite loop, this is done so as to not
- * 	disturb the epoll_wait mechanism which is more complex path.
- * 	(i.e to not go to epoll_wait, when handshake in progress).
+ *	so logically no case for infinite loop, this is done so as to not
+ *	disturb the epoll_wait mechanism which is more complex path.
+ *	(i.e to not go to epoll_wait, when handshake in progress).
  */
+#define SVC_TLS_RECV(xprt, address, bytes, flags)                              \
+	({                                                                     \
+		ssize_t __ret;                                                 \
+		while (xprt->xp_tls.tls_enabled == true &&                     \
+		       xprt->xp_tls.tls_established == false) {                \
+			LogDebugTLS(TLS_DISPATCH,                              \
+				    "RWaiting established xprt:%p fd:%" PRId32,\
+				    xprt, xprt->xp_fd);                        \
+			usleep(1000);                                          \
+		}                                                              \
+		if (xprt->xp_tls.tls_established == true)                      \
+			__ret = xp_tls_recv_impl(xprt, address, bytes, flags); \
+		else                                                           \
+			__ret = recv(xprt->xp_fd, address, bytes, flags);      \
+		__ret;                                                         \
+	})
 
-#define SVC_TLS_RECV(xprt, address, bytes, flags) \
-    ({ \
-        ssize_t __ret; \
-	while(xprt->xp_tls.tls_enabled == true && xprt->xp_tls.tls_established == false)	\
-	{	\
-		LogDebugTLS(DPP_DISPATCH, "RWaiting for tls_established xprt:%p fd:%d", xprt, xprt->xp_fd);	\
-		usleep(1000);	\
-	}	\
-        if (xprt->xp_ops->xp_tls_recv != NULL && xprt->xp_tls.tls_established == true) 	\
-            __ret = (*(xprt)->xp_ops->xp_tls_recv)(xprt, address, bytes, flags); \
-        else \
-            __ret = recv(xprt->xp_fd, address, bytes, flags); \
-        __ret; \
-    })
-
-
-#define SVC_TLS_SEND(xprt, msg, flags)	\
-    ({ \
-        ssize_t __ret; \
-	while(xprt->xp_tls.tls_enabled == true && xprt->xp_tls.tls_established == false)	\
-	{	\
-		LogDebugTLS(DPP_DISPATCH, "SWaiting for tls_established xprt:%p fd:%d", xprt, xprt->xp_fd);	\
-		usleep(1000);	\
-	}	\
-        if (xprt->xp_ops->xp_tls_send != NULL && xprt->xp_tls.tls_established == true) 	\
-		__ret = xprt->xp_ops->xp_tls_send(xprt, msg, MSG_DONTWAIT);	\
-	 else 	\
-		__ret = sendmsg(xprt->xp_fd, msg, MSG_DONTWAIT);	\
-        __ret; \
-    })
+#define SVC_TLS_SEND(xprt, msg, flags)                                         \
+	({                                                                     \
+		ssize_t __ret;                                                 \
+		while (xprt->xp_tls.tls_enabled == true &&                     \
+		       xprt->xp_tls.tls_established == false) {                \
+			LogDebugTLS(TLS_DISPATCH,                              \
+				    "SWaiting established xprt:%p fd:%" PRId32,\
+				    xprt, xprt->xp_fd);                        \
+			usleep(1000);                                          \
+		}                                                              \
+		if (xprt->xp_tls.tls_established == true)                      \
+			__ret = xp_tls_send_impl(xprt, msg, MSG_DONTWAIT);     \
+		else                                                           \
+			__ret = sendmsg(xprt->xp_fd, msg, MSG_DONTWAIT);       \
+		__ret;                                                         \
+	})
+#define SVC_TLS_CLOSE(xprt)                               \
+	({                                                \
+		if (xprt->xp_tls.tls_established == true) \
+			xp_tls_close_impl(xprt);          \
+	})
 
 bool is_handshake_msg(SVCXPRT *xprt);
 #endif /* USE_TLS */
@@ -667,8 +674,7 @@ static inline void svc_destroy_it(SVCXPRT *xprt,
 	    && xprt->xp_fd != RPC_ANYFD) {
 		/*  need to tell the client about TLS Connection closure */
 #ifdef USE_TLS
-		if ((xprt)->xp_ops->xp_tls_close)
-			(*(xprt)->xp_ops->xp_tls_close)(xprt);
+		SVC_TLS_CLOSE(xprt);
 #endif
 		(void)shutdown(xprt->xp_fd, SHUT_RDWR);
 		if (xprt->xp_fd_send != RPC_ANYFD)

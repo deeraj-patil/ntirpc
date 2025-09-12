@@ -229,6 +229,10 @@ NTIRPC_${NTIRPC_VERSION_BASE} {
     xdr_wrapstring;
     xdrmem_ncreate;
     xdrstdio_create;
+    xprt_tls_init;
+    xp_tls_recv_impl;
+    xp_tls_send_impl;
+    xp_tls_close_impl;
 
   local:
     *;
