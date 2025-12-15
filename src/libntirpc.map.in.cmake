@@ -36,6 +36,7 @@ NTIRPC_${NTIRPC_VERSION_BASE} {
     _svcauth_none;
     _svcauth_short;
     _svcauth_unix;
+    _svcauth_tls;
 
     # a*
     authgss_ncreate;
@@ -92,6 +93,7 @@ NTIRPC_${NTIRPC_VERSION_BASE} {
     # n*
     nc_perror;
     nc_sperror;
+    nfs_init_tls;
 
     # o*
     opr_rbtree_first;
@@ -229,6 +231,10 @@ NTIRPC_${NTIRPC_VERSION_BASE} {
     xdr_wrapstring;
     xdrmem_ncreate;
     xdrstdio_create;
+    xprt_tls_init;
+    xp_tls_recv_impl;
+    xp_tls_send_impl;
+    xp_tls_close_impl;
 
   local:
     *;
