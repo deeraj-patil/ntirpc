@@ -268,6 +268,29 @@ svc_init(svc_init_params *params)
 	__svc_params->max_rdma_connections = params->max_rdma_connections;
 #endif
 
+/* TCP zerocopy parameters (Linux MSG_ZEROCOPY) */
+#if defined(HAVE_TCP_ZEROCOPY) || (defined(__linux__) && defined(MSG_ZEROCOPY) && defined(SO_ZEROCOPY))
+	if (!update) {
+		__svc_params->tcp_zerocopy_enabled = params->tcp_zerocopy_enabled;
+	}
+	{
+		uint32_t min_bytes = (params->tcp_zerocopy_min_bytes > 0)
+			? params->tcp_zerocopy_min_bytes
+			: (update ? 0 : 16384); /* 16 KiB default */
+		if (min_bytes > 0) {
+			/* Round up to the next page-aligned size so that
+			 * MSG_ZEROCOPY zero-copy is always triggered on a
+			 * page boundary, avoiding partial-page copies.
+			 */
+			uint32_t page_size = (uint32_t)sysconf(_SC_PAGE_SIZE);
+			if (min_bytes & (page_size - 1))
+				min_bytes = (min_bytes + page_size - 1) &
+					    ~(page_size - 1);
+			__svc_params->tcp_zerocopy_min_bytes = min_bytes;
+		}
+	}
+#endif
+
 	if (!update)
 		__svc_params->initialized = true;
 

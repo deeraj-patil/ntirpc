@@ -45,7 +45,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sched.h>
 #include <misc/timespec.h>
+#ifdef __linux__
+#include <linux/errqueue.h>
+#endif
 
 #include <rpc/types.h>
 #include <misc/portable.h>
@@ -72,7 +76,443 @@
 #define LAST_FRAG_XDR_UNITS ((LAST_FRAG - 1) & ~(BYTES_PER_XDR_UNIT - 1))
 #define MAXALLOCA (256)
 
-/* Returns 0 on success, EWOULDBLOCK if would block, <0 on error */
+#if defined(__linux__) && defined(MSG_ZEROCOPY) && defined(SO_ZEROCOPY)
+#define HAVE_TCP_ZEROCOPY 1
+
+/*
+ * svc_ioq_zc_note_send - record a successful MSG_ZEROCOPY sendmsg for xioq.
+ *
+ * Called once per successful sendmsg(MSG_ZEROCOPY) call.  The kernel assigns
+ * a monotonically-increasing 32-bit cookie to each such call on the socket;
+ * this function mirrors that assignment so we can later match errqueue
+ * completions back to the right xioq.
+ *
+ * On the first ZC send for this xioq, zc_cookie_lo is set to the current
+ * per-connection counter (zc_next_cookie), which is then incremented.
+ * zc_outstanding tracks how many ZC sendmsgs are still in flight for this
+ * xioq; the xioq cannot be freed until that count reaches zero.
+ *
+ * Locking: none (privately accessed by the serialized transmit thread).
+ */
+static void
+svc_ioq_zc_note_send(struct rpc_dplx_rec *rec, struct xdr_ioq *xioq)
+{
+	if (xioq->zc_outstanding == 0)
+		xioq->zc_cookie_lo = rec->zc_next_cookie;
+	rec->zc_next_cookie++;
+	xioq->zc_outstanding++;
+}
+
+/*
+ * svc_ioq_zc_xioq_done - test whether all ZC sends for xioq are complete.
+ *
+ * Returns true if every MSG_ZEROCOPY sendmsg issued for this xioq has been
+ * acknowledged by the kernel via the socket errqueue.
+ *
+ * The cookie range assigned to this xioq is [zc_cookie_lo,
+ * zc_cookie_lo + zc_outstanding).  Completion is tracked by zc_acked, a
+ * per-connection watermark: all cookies strictly below zc_acked have been
+ * confirmed complete (in-order or via OOO merging).  If the exclusive upper
+ * bound of this xioq's range (zc_cookie_lo + zc_outstanding) is at or below
+ * zc_acked, every send is done and the xioq can be freed.
+ *
+ * A zc_outstanding of zero means no ZC sends were ever issued; returns true
+ * immediately so the caller can free the xioq on the normal path.
+ *
+ * Locking: caller must hold zc_lock.
+ */
+static bool
+svc_ioq_zc_xioq_done(struct rpc_dplx_rec *rec, struct xdr_ioq *xioq)
+{
+	uint32_t last;
+
+	if (xioq->zc_outstanding == 0)
+		return true;
+	last = xioq->zc_cookie_lo + xioq->zc_outstanding;
+	return last <= rec->zc_acked;
+}
+
+/*
+ * svc_ioq_zc_reap_locked - free completed ZC xioqs from the deferred queue.
+ *
+ * Walks rec->zcq and destroys every xioq for which all MSG_ZEROCOPY sends
+ * have been acknowledged (svc_ioq_zc_xioq_done() returns true).  Each freed
+ * xioq increments *release_count so the caller can drive the matching
+ * SVC_RELEASE calls outside the mutex (SVC_RELEASE can block; we must not
+ * hold writeq.qmutex across it).
+ *
+ * Entries whose sends are still pending are left in zcq and will be visited
+ * again the next time svc_ioq_zc_drain() processes an errqueue notification.
+ *
+ * Locking: caller must hold zc_lock.
+ */
+/*
+ * svc_ioq_zc_harvest_locked - move completed xioqs off zcq into harvest_list.
+ *
+ * Called under zc_lock.  Does only pointer surgery and watermark
+ * checks — no memory allocation, no XDR_DESTROY, no SVC_RELEASE.
+ * Callers must walk harvest_list outside the mutex to do the heavy work.
+ *
+ * Returns the number of xioqs harvested (= how many SVC_RELEASE calls needed).
+ */
+static int
+svc_ioq_zc_harvest_locked(struct rpc_dplx_rec *rec,
+			   zc_harvest_list_t *harvest_list)
+{
+	struct poolq_entry *have;
+	struct poolq_entry *next;
+	int count = 0;
+
+	have = TAILQ_FIRST(&rec->zcq);
+	while (have != NULL) {
+		struct xdr_ioq *xioq = _IOQ(have);
+
+		next = TAILQ_NEXT(have, q);
+		if (svc_ioq_zc_xioq_done(rec, xioq)) {
+			TAILQ_REMOVE(&rec->zcq, have, q);
+			uint32_t _inf = atomic_dec_uint32_t(&rec->zc_inflight);
+			__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
+				"%s: fd %d reap: inflight %"PRIu32"->%"PRIu32,
+				__func__, rec->xprt.xp_fd,
+				_inf + 1, _inf);
+			xioq->zc_outstanding = 0;
+			/* Move to caller's list — XDR_DESTROY happens outside mutex */
+			TAILQ_INSERT_TAIL(harvest_list, have, q);
+			count++;
+		}
+		have = next;
+	}
+	return count;
+}
+
+/* Destroy all xioqs on harvest_list (must be called without writeq.qmutex). */
+static void
+svc_ioq_zc_destroy_harvested(zc_harvest_list_t *harvest_list)
+{
+	struct poolq_entry *have;
+
+	while ((have = TAILQ_FIRST(harvest_list)) != NULL) {
+		struct xdr_ioq *xioq = _IOQ(have);
+
+		TAILQ_REMOVE(harvest_list, have, q);
+		XDR_DESTROY(xioq->xdrs);
+	}
+}
+
+/*
+ * svc_ioq_zc_absorb_ooo - merge stashed out-of-order ranges into zc_acked.
+ *
+ * The kernel delivers MSG_ZEROCOPY completions via the socket errqueue as
+ * sock_extended_err messages carrying an inclusive [lo, hi] cookie range.
+ * Under normal in-order delivery these always touch the current zc_acked
+ * watermark and svc_ioq_zc_complete_locked() advances it directly.
+ *
+ * On retransmission or connection teardown the kernel may report a later
+ * range before an earlier one.  svc_ioq_zc_complete_locked() stashes such
+ * ranges in rec->zc_ooo[].  This function is called after every watermark
+ * advance to drain those stashed ranges: any range that now overlaps or
+ * is contiguous with zc_acked is merged in, potentially enabling a chain
+ * of further merges.  The loop repeats until no more progress is made.
+ *
+ * Stale entries (hi < zc_acked, already subsumed) are also evicted here to
+ * keep the array small.
+ *
+ * Locking: caller must hold zc_lock.
+ */
+static void
+svc_ioq_zc_absorb_ooo(struct rpc_dplx_rec *rec)
+{
+	bool progressed = true;
+
+	while (progressed) {
+		uint8_t i;
+
+		progressed = false;
+		for (i = 0; i < rec->zc_ooo_n; ) {
+			uint32_t lo = rec->zc_ooo[i].lo;
+			uint32_t hi = rec->zc_ooo[i].hi;
+
+			if (hi < rec->zc_acked) {
+				rec->zc_ooo[i] = rec->zc_ooo[rec->zc_ooo_n - 1];
+				rec->zc_ooo_n--;
+				progressed = true;
+				continue;
+			}
+			if (lo <= rec->zc_acked && hi >= rec->zc_acked) {
+				rec->zc_acked = hi + 1;
+				rec->zc_ooo[i] = rec->zc_ooo[rec->zc_ooo_n - 1];
+				rec->zc_ooo_n--;
+				progressed = true;
+				continue;
+			}
+			i++;
+		}
+	}
+}
+
+/*
+ * svc_ioq_zc_complete_locked - advance zc_acked for a completed [lo, hi]
+ * cookie range and harvest any zcq entries that are now fully acknowledged.
+ *
+ * Called from svc_ioq_zc_drain() with zc_lock already held.  Done
+ * xioqs are moved into harvest_list (pointer surgery only — no XDR_DESTROY
+ * under the lock).  The caller destroys them after dropping the mutex.
+ *
+ * Locking: caller must hold zc_lock.  Must NOT touch the mutex.
+ */
+static void
+svc_ioq_zc_complete_locked(struct rpc_dplx_rec *rec, uint32_t lo, uint32_t hi,
+			    zc_harvest_list_t *harvest_list)
+{
+	SVCXPRT *xprt = &rec->xprt;
+	uint8_t i;
+
+	if ((int32_t)(hi - lo) < 0)
+		return;
+
+	if (hi < rec->zc_acked)
+		return;
+
+	if (lo <= rec->zc_acked) {
+		/* Touches watermark — advance, then pull in any OOO ranges. */
+		if (hi + 1 > rec->zc_acked)
+			rec->zc_acked = hi + 1;
+		svc_ioq_zc_absorb_ooo(rec);
+	} else {
+		/* Out-of-order: stash and merge. Dropping these stalls zc_acked
+		 * forever and leaks every later zcq entry.
+		 */
+		for (i = 0; i < rec->zc_ooo_n; i++) {
+			uint32_t plo = rec->zc_ooo[i].lo;
+			uint32_t phi = rec->zc_ooo[i].hi;
+
+			if (lo <= phi + 1 && hi + 1 >= plo) {
+				if (lo < plo)
+					rec->zc_ooo[i].lo = lo;
+				if (hi > phi)
+					rec->zc_ooo[i].hi = hi;
+				svc_ioq_zc_absorb_ooo(rec);
+				goto reap;
+			}
+		}
+		if (rec->zc_ooo_n < SVC_ZC_OOO_MAX) {
+			rec->zc_ooo[rec->zc_ooo_n].lo = lo;
+			rec->zc_ooo[rec->zc_ooo_n].hi = hi;
+			rec->zc_ooo_n++;
+			svc_ioq_zc_absorb_ooo(rec);
+		} else {
+			__warnx(TIRPC_DEBUG_FLAG_WARN,
+				"%s: fd %d zc_ooo full; force acked %" PRIu32
+				" -> %" PRIu32,
+				__func__, xprt->xp_fd, rec->zc_acked, hi + 1);
+			if (hi + 1 > rec->zc_acked)
+				rec->zc_acked = hi + 1;
+			rec->zc_ooo_n = 0;
+		}
+	}
+
+reap:
+	svc_ioq_zc_harvest_locked(rec, harvest_list);
+}
+
+static bool
+svc_ioq_zc_parse_serr(struct cmsghdr *cmsg, uint32_t *lo, uint32_t *hi,
+		      bool *copied)
+{
+	struct sock_extended_err *serr;
+
+	*copied = false;
+
+	if (cmsg->cmsg_level == SOL_IP) {
+		if (cmsg->cmsg_type != IP_RECVERR)
+			return false;
+	} else if (cmsg->cmsg_level == SOL_IPV6) {
+		if (cmsg->cmsg_type != IPV6_RECVERR)
+			return false;
+	} else {
+		return false;
+	}
+
+	if (cmsg->cmsg_len < CMSG_LEN(sizeof(*serr)))
+		return false;
+
+	serr = (struct sock_extended_err *)CMSG_DATA(cmsg);
+	if (serr->ee_origin != SO_EE_ORIGIN_ZEROCOPY)
+		return false;
+
+	*lo = serr->ee_info;
+	*hi = serr->ee_data;
+#ifdef SO_EE_CODE_ZEROCOPY_COPIED
+	*copied = (serr->ee_code & SO_EE_CODE_ZEROCOPY_COPIED) != 0;
+#endif
+	return true;
+}
+
+/*
+ * svc_ioq_zc_drain_collect - drain the errqueue and collect completed xioqs.
+ *
+ * Reads all pending MSG_ZEROCOPY completions from the socket errqueue,
+ * advances zc_acked, and moves fully-done xioqs off zcq into harvest_list
+ * (pointer surgery only — no XDR_DESTROY, no SVC_RELEASE under the mutex).
+ *
+ * Returns the number of xioqs harvested.  The caller must call
+ * svc_ioq_zc_drain_release() to destroy them and drop the xprt refcounts.
+ */
+int
+svc_ioq_zc_drain_collect(SVCXPRT *xprt,
+			  zc_harvest_list_t *harvest_list)
+{
+	struct rpc_dplx_rec *rec = REC_XPRT(xprt);
+	struct msghdr msg;
+	struct cmsghdr *cmsg;
+	char control[512];
+	uint32_t lo;
+	uint32_t hi;
+	bool copied;
+	int total = 0;
+
+	if (!__svc_params->tcp_zerocopy_enabled || !rec->zc_sock_ok)
+		return 0;
+
+	for (;;) {
+		int n;
+
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_control = control;
+		msg.msg_controllen = sizeof(control);
+
+		if (recvmsg(xprt->xp_fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT) < 0)
+			break;
+
+		if (msg.msg_flags & MSG_CTRUNC) {
+			__warnx(TIRPC_DEBUG_FLAG_WARN,
+				"%s: fd %d MSG_CTRUNC on errqueue; cookies may be lost",
+				__func__, xprt->xp_fd);
+		}
+
+		/*
+		 * Critical section: advance zc_acked and move completed xioqs
+		 * off zcq into harvest_list.  No XDR_DESTROY — pointer surgery
+		 * only so the mutex is held as briefly as possible.
+		 */
+		mutex_lock(&rec->zc_lock);
+		for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+		     cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+			if (!svc_ioq_zc_parse_serr(cmsg, &lo, &hi, &copied))
+				continue;
+
+			svc_ioq_zc_complete_locked(rec, lo, hi, harvest_list);
+
+			if (copied && rec->zc_sock_ok) {
+				rec->zc_sock_ok = false;
+				__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+					"%s: fd %d SO_EE_CODE_ZEROCOPY_COPIED; disabling MSG_ZEROCOPY",
+					__func__, xprt->xp_fd);
+			}
+		}
+		mutex_unlock(&rec->zc_lock);
+
+		/* count this recvmsg's contribution */
+		n = 0;
+		{
+			struct poolq_entry *e;
+			TAILQ_FOREACH(e, harvest_list, q)
+				n++;
+		}
+		__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
+			"%s: fd %d drain iter: reaped %d inflight %"PRIu32,
+			__func__, xprt->xp_fd,
+			n - total,
+			atomic_fetch_uint32_t(&rec->zc_inflight));
+		total = n;
+	}
+	return total;
+}
+
+/*
+ * svc_ioq_zc_drain_release - destroy harvested xioqs and drop xprt refcounts.
+ *
+ * Called after IOQ_WRITING is cleared so the TX path is unblocked before
+ * any slow memory-freeing work happens.
+ */
+void
+svc_ioq_zc_drain_release(SVCXPRT *xprt,
+			  zc_harvest_list_t *harvest_list,
+			  int release_count)
+{
+	__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
+		"%s: fd %d drain done: releasing %d inflight %"PRIu32,
+		__func__, xprt->xp_fd,
+		release_count,
+		atomic_fetch_uint32_t(&REC_XPRT(xprt)->zc_inflight));
+	svc_ioq_zc_destroy_harvested(harvest_list);
+
+	while (release_count-- > 0)
+		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+}
+
+/* Convenience wrapper for callers that don't need to split the two phases. */
+void
+svc_ioq_zc_drain(SVCXPRT *xprt)
+{
+	zc_harvest_list_t harvest_list;
+	int release_count;
+
+	TAILQ_INIT(&harvest_list);
+	release_count = svc_ioq_zc_drain_collect(xprt, &harvest_list);
+	if (release_count > 0)
+		svc_ioq_zc_drain_release(xprt, &harvest_list, release_count);
+}
+
+void
+svc_ioq_zc_release_all(SVCXPRT *xprt)
+{
+	struct rpc_dplx_rec *rec = REC_XPRT(xprt);
+	zc_harvest_list_t harvest_list;
+	struct poolq_entry *have;
+	int release_count = 0;
+
+	TAILQ_INIT(&harvest_list);
+
+	mutex_lock(&rec->zc_lock);
+	while ((have = TAILQ_FIRST(&rec->zcq)) != NULL) {
+		uint32_t _inf = atomic_dec_uint32_t(&rec->zc_inflight);
+
+		__warnx(TIRPC_DEBUG_FLAG_WARN,
+			"%s: fd %d release_all: inflight %"PRIu32"->%"PRIu32,
+			__func__, xprt->xp_fd,
+			_inf + 1, _inf);
+		TAILQ_REMOVE(&rec->zcq, have, q);
+		TAILQ_INSERT_TAIL(&harvest_list, have, q);
+		release_count++;
+	}
+	rec->zc_ooo_n = 0;
+	mutex_unlock(&rec->zc_lock);
+
+	/* XDR_DESTROY outside the mutex. */
+	svc_ioq_zc_destroy_harvested(&harvest_list);
+
+	while (release_count-- > 0)
+		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+}
+#else
+#define HAVE_TCP_ZEROCOPY 0
+
+void
+svc_ioq_zc_drain(SVCXPRT *xprt)
+{
+	(void)xprt;
+}
+
+void
+svc_ioq_zc_release_all(SVCXPRT *xprt)
+{
+	(void)xprt;
+}
+#endif /* __linux__ && MSG_ZEROCOPY && SO_ZEROCOPY */
+
+/* Returns 0 on success, EWOULDBLOCK if would block, <0 on error
+ */
 static inline int
 svc_ioq_flushv(SVCXPRT *xprt, struct xdr_ioq *xioq)
 {
@@ -80,7 +520,6 @@ svc_ioq_flushv(SVCXPRT *xprt, struct xdr_ioq *xioq)
 	struct iovec *iov;
 	struct xdr_vio *vio;
 	ssize_t result;
-	u_int32_t frag_header;
 	u_int32_t fbytes;
 	int error = 0;
 	int frag_needed = 0;
@@ -142,6 +581,10 @@ svc_ioq_flushv(SVCXPRT *xprt, struct xdr_ioq *xioq)
 	while (remaining > 0) {
 		int i;
 		int frag_hdr_size = 0;
+		int send_flags;
+#if HAVE_TCP_ZEROCOPY
+		bool use_zc = false;
+#endif
 
 		/* Note that there may be lots of re-walking the ioq to
 		 * count the number of buffers or fill the buffers in the vio,
@@ -153,12 +596,9 @@ svc_ioq_flushv(SVCXPRT *xprt, struct xdr_ioq *xioq)
 		 * don't walk more of the ioq than we need to. But that adds a
 		 * lot of complexity, and just saves walking a linked list.
 		 *
-		 * A more relevant improvement here might actually be to use
-		 * larger buffers than 8k. Optionally, when we do more to
-		 * implement zero copy, the largest responses which are
-		 * READ and READDIR will be adding a single buffer, or a small
-		 * number of buffers to the ioq instead of copying into the
-		 * 8k byte buffers.
+		 * Large READ/READDIR payloads are already attached via
+		 * xdr_ioq_putbufs(UIO_FLAG_REFER) — not copied into the 8k
+		 * XDR buffers. MSG_ZEROCOPY pins those referred pages.
 		 */
 		iov_count = XDR_IOVCOUNT(xioq->xdrs, xioq->write_start, fbytes);
 
@@ -170,10 +610,13 @@ svc_ioq_flushv(SVCXPRT *xprt, struct xdr_ioq *xioq)
 			 * of it we have sent so far.
 			 */
 			frag_needed = 1;
-			frag_header = htonl((u_int32_t) (fbytes | last_frag));
-			iov[0].iov_base = ((char *) &frag_header) +
+			/* Store on xioq so MSG_ZEROCOPY can pin durable memory
+			 * (never the stack local).
+			 */
+			xioq->zc_frag_header = htonl((u_int32_t)(fbytes | last_frag));
+			iov[0].iov_base = ((char *)&xioq->zc_frag_header) +
 						xioq->frag_hdr_bytes_sent;
-			iov[0].iov_len = sizeof(frag_header) -
+			iov[0].iov_len = sizeof(xioq->zc_frag_header) -
 						xioq->frag_hdr_bytes_sent;
 			frag_hdr_size = iov[0].iov_len;
 			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
@@ -218,6 +661,19 @@ svc_ioq_flushv(SVCXPRT *xprt, struct xdr_ioq *xioq)
 		msg.msg_iov = iov;
 		msg.msg_iovlen = iov_count + frag_needed;
 
+		send_flags = MSG_DONTWAIT;
+		if (fbytes < remaining)
+			send_flags |= MSG_MORE;
+#if HAVE_TCP_ZEROCOPY
+		use_zc = false;
+		if (__svc_params->tcp_zerocopy_enabled &&
+		    REC_XPRT(xprt)->zc_sock_ok &&
+		    remaining >= __svc_params->tcp_zerocopy_min_bytes) {
+			send_flags |= MSG_ZEROCOPY;
+			use_zc = true;
+		}
+#endif
+
 again:
 		XPRT_AUTO_TRACEPOINT(xprt, sendmsg, TRACE_DEBUG,
 			"Calling sendmsg. remaining: {}, frag_needed: {}, "
@@ -228,9 +684,26 @@ again:
 		errno = 0;
 
 #ifdef USE_TLS
-		result = svc_tls_send(xprt, &msg, MSG_DONTWAIT);
+		/* TLS encrypts into its own buffers; MSG_ZEROCOPY on the
+		 * cleartext iov is not applicable.
+		 */
+#if HAVE_TCP_ZEROCOPY
+		use_zc = false;
+		result = svc_tls_send(xprt, &msg, send_flags & ~MSG_ZEROCOPY);
 #else
-		result = sendmsg(xprt->xp_fd, &msg, MSG_DONTWAIT);
+		result = svc_tls_send(xprt, &msg, send_flags);
+#endif
+#else
+		result = sendmsg(xprt->xp_fd, &msg, send_flags);
+#if HAVE_TCP_ZEROCOPY
+		/* ENOBUFS: ZC path unavailable; retry once without it. */
+		if (unlikely(result < 0 && use_zc && errno == ENOBUFS)) {
+			send_flags &= ~MSG_ZEROCOPY;
+			use_zc = false;
+			errno = 0;
+			result = sendmsg(xprt->xp_fd, &msg, send_flags);
+		}
+#endif
 #endif
 
 		error = errno;
@@ -254,6 +727,18 @@ again:
 			}
 			break;
 		}
+
+#if HAVE_TCP_ZEROCOPY
+		if (use_zc && result > 0) {
+			__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
+				"%s: fd %d ZC sendmsg: result %ld"
+				" remaining %"PRIu32" zc_outstanding %"PRIu32,
+				__func__, xprt->xp_fd,
+				(long)result, remaining,
+				xioq->zc_outstanding);
+			svc_ioq_zc_note_send(REC_XPRT(xprt), xioq);
+		}
+#endif
 
 		if (result < frag_hdr_size) {
 			/* We had a fragment headerr and didn't manage to send
@@ -284,7 +769,7 @@ again:
 		 * go ahead and indicate that... Also deduct any fragment
 		 * header bytes from result.
 		 */
-		xioq->frag_hdr_bytes_sent = sizeof(frag_header);
+		xioq->frag_hdr_bytes_sent = sizeof(xioq->zc_frag_header);
 		result -= frag_hdr_size;
 		frag_hdr_size = 0;
 
@@ -332,18 +817,21 @@ void svc_ioq_write(SVCXPRT *xprt)
 		.tv_sec = 0,
 		.tv_nsec = 0,
 	};
+	uint32_t local_counter = 0;
+
 	while (atomic_postset_uint16_t_bits(&xprt->xp_flags,
 				SVC_XPRT_FLAG_IOQ_WRITING)
 		       & SVC_XPRT_FLAG_IOQ_WRITING) {
+		if(__svc_params->tcp_zerocopy_enabled) {
+			sched_yield();
+		} else {
 			nanosleep(&ts, NULL);
-			if (xprt->xp_flags & SVC_XPRT_FLAG_DESTROYED) {
-				XPRT_UNIQUE_AUTO_TRACEPOINT(xprt, ioq_working, TRACE_INFO,
-					"xprt is being cleared, no need for transmit");
-				return;
-			}
+		}
+		if (xprt->xp_flags & SVC_XPRT_FLAG_DESTROYED) {
 			XPRT_UNIQUE_AUTO_TRACEPOINT(xprt, ioq_working, TRACE_INFO,
-				"xprt is being transmitted by another thread ");
-
+				"xprt is being cleared, no need for transmit");
+			return;
+		}
 	}
 
 	mutex_lock(&rec->writeq.qmutex);
@@ -435,14 +923,90 @@ void svc_ioq_write(SVCXPRT *xprt)
 		have = TAILQ_FIRST(&rec->writeq.qh);
 		mutex_unlock(&rec->writeq.qmutex);
 
+#if HAVE_TCP_ZEROCOPY
+		if (xioq->zc_outstanding > 0) {
+			bool done;
+			++local_counter;
+			mutex_lock(&rec->zc_lock);
+			done = svc_ioq_zc_xioq_done(rec, xioq);
+			if (!done) {
+				/*
+				 * Pages still pinned by the kernel — defer this
+				 * xioq's free onto zcq.
+				 * svc_ioq_zc_drain() when the ACKs arrive and
+				 * svc_ioq_zc_reap_locked() will do the
+				 * SVC_RELEASE + XDR_DESTROY at that point.
+				 *
+				 */
+				TAILQ_INSERT_TAIL(&rec->zcq, &(xioq->ioq_s), q);
+				uint32_t _inf = atomic_inc_uint32_t(&rec->zc_inflight);
+				mutex_unlock(&rec->zc_lock);
+				__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
+				 "%s: fd %d enqueue: inflight %"PRIu32"->%"PRIu32
+				 " zc_outstanding %"PRIu32,
+				 __func__, xprt->xp_fd,
+				 _inf - 1, _inf, xioq->zc_outstanding);
+				/* Skip SVC_RELEASE/XDR_DESTROY — zcq owns it */
+				goto next_reply;
+			}
+			mutex_unlock(&rec->zc_lock);
+			xioq->zc_outstanding = 0;
+		}
+#endif
+
 		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
 			"%s: %p fd %d About to release",
 			__func__, xprt, xprt->xp_fd);
 		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
 		XDR_DESTROY(xioq->xdrs);
+
+next_reply:;
+
 	}
+#if HAVE_TCP_ZEROCOPY
+	{
+		/* Unblock other threads waiting to TX on this xprt before
+		 * doing the slow XDR_DESTROY + SVC_RELEASE work.
+		 */
+		atomic_postclear_uint16_t_bits(&xprt->xp_flags,
+					       SVC_XPRT_FLAG_IOQ_WRITING);
+		if ((__svc_params->tcp_zerocopy_enabled) &&
+		    (local_counter < atomic_fetch_uint32_t(&rec->zc_inflight) ||
+		     local_counter > 8)) {
+			svc_ioq_zc_drain(xprt);
+			local_counter = 0;
+		}
+
+		/*
+		 * New data to send may have arrived in writeq while we were draining.
+		 * be opportunistic here, the possiblity of netwrok buffer being
+		 * full is less because of ZeroCopy, and threads might be busy
+		 * somewhere else if there is more data availbale in queue to
+		 * process, process it.
+		 * Only loop if: xprt is alive, not blocked on EWOULDBLOCK, and
+		 * no other thread grabbed IOQ_WRITING in the gap.
+		 */
+		if (__svc_params->tcp_zerocopy_enabled &&
+		    !destroy_xprt &&
+		    !(xprt->xp_flags & SVC_XPRT_FLAG_DESTROYED) &&
+		    !(atomic_postset_uint16_t_bits(&xprt->xp_flags,
+					SVC_XPRT_FLAG_IOQ_WRITING)
+		      & SVC_XPRT_FLAG_IOQ_WRITING)) {
+			mutex_lock(&rec->writeq.qmutex);
+			have = TAILQ_FIRST(&rec->writeq.qh);
+			mutex_unlock(&rec->writeq.qmutex);
+			if (have && !(_IOQ(have)->has_blocked)) {
+				goto next_reply;
+			}
+			/* Nothing to send or socket blocked — drop the flag. */
+			atomic_postclear_uint16_t_bits(&xprt->xp_flags,
+						SVC_XPRT_FLAG_IOQ_WRITING);
+		}
+	}
+#else
 	atomic_postclear_uint16_t_bits(&xprt->xp_flags,
 				SVC_XPRT_FLAG_IOQ_WRITING);
+#endif
 
 	if (destroy_xprt) {
 		SVC_DESTROY(xprt);

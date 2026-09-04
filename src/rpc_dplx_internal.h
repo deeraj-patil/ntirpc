@@ -57,6 +57,34 @@ struct rpc_dplx_rec {
 	struct svc_xprt xprt;		/**< Transport Independent handle */
 	struct xdr_ioq ioq;
 	struct poolq_head writeq;	/**< poolq for write requests */
+	/*
+	 * xioqs whose bytes are in the kernel but still pinned for
+	 * MSG_ZEROCOPY. Protected by writeq.qmutex. zc_next_cookie matches
+	 * the per-socket counter the kernel assigns on each successful
+	 * MSG_ZEROCOPY sendmsg.
+	 *
+	 * Completions may arrive out of order (retransmission / teardown).
+	 * zc_ooo holds inclusive [lo,hi] cookie ranges that completed ahead
+	 * of zc_acked so the watermark can still advance — dropping those
+	 * caused unbounded zcq growth (memory leak).
+	 *
+	 * zcq uses a plain TAILQ rather than poolq_head because the
+	 * poolq_head mutex and qsize fields are not needed here.
+	 * zc_lock protects zcq and associated zero-copy tracking fields
+	 * to isolate zero-copy churning from writeq.qmutex.
+	 */
+	mutex_t zc_lock;		/* protects ZC queues & tracking fields */
+	TAILQ_HEAD(, poolq_entry) zcq;	/**< deferred ZC xioqs */
+	uint32_t zc_inflight;		/* xioqs on zcq waiting for kernel ACK; atomic */
+	uint32_t zc_next_cookie;	/* next cookie to assign on ZC sendmsg */
+	uint32_t zc_acked;		/* all cookies < this are completed */
+#define SVC_ZC_OOO_MAX 8	/* kernel reorder depth is typically ≤ 4 */
+	struct {
+		uint32_t lo;
+		uint32_t hi;
+	} zc_ooo[SVC_ZC_OOO_MAX];
+	uint8_t zc_ooo_n;
+	bool zc_sock_ok;		/* SO_ZEROCOPY succeeded on this fd */
 	struct opr_rbtree call_replies;
 	struct opr_rbtree rdma_call_expires;	/**< call expiration tree for RDMA */
 	struct opr_rbtree_node fd_node;
@@ -130,6 +158,13 @@ rpc_dplx_rec_init(struct rpc_dplx_rec *rec)
 	TAILQ_INIT(&rec->writeq.qh);
 	mutex_init(&rec->writeq.qmutex, NULL);
 	rec->writeq.qcount = 0;
+	mutex_init(&rec->zc_lock, NULL);
+	TAILQ_INIT(&rec->zcq);
+	rec->zc_inflight = 0;
+	rec->zc_next_cookie = 0;
+	rec->zc_acked = 0;
+	rec->zc_ooo_n = 0;
+	rec->zc_sock_ok = false;
 	/* Stop this xprt being cleaned immediately */
 	(void)clock_gettime(CLOCK_MONOTONIC_FAST, &(rec->recv.ts));
 
@@ -149,6 +184,7 @@ rpc_dplx_rec_destroy(struct rpc_dplx_rec *rec)
 	rpc_dplx_lock_destroy(&rec->recv.lock);
 	mutex_destroy(&rec->xprt.xp_lock);
 	mutex_destroy(&rec->writeq.qmutex);
+	mutex_destroy(&rec->zc_lock);
 
 	if (rec->xprt.proxy_protocol_tlv_headers.tlv_count > 0) {
 		for (uint16_t i = 0; i < rec->xprt.proxy_protocol_tlv_headers.tlv_count; i++)
