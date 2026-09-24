@@ -80,6 +80,14 @@
 #define HAVE_TCP_ZEROCOPY 1
 
 /*
+ * Cookies are the kernel's per-socket u32 sk_zckey, which wraps.  A long-lived
+ * connection doing 64k ZC sends reaches 2^32 cookies after ~256TB, so every
+ * comparison has to be modular rather than a plain magnitude test.
+ */
+#define ZC_COOKIE_LT(a, b)	((int32_t)((a) - (b)) < 0)
+#define ZC_COOKIE_GE(a, b)	((int32_t)((a) - (b)) >= 0)
+
+/*
  * svc_ioq_zc_note_send - record a successful MSG_ZEROCOPY sendmsg for xioq.
  *
  * Called once per successful sendmsg(MSG_ZEROCOPY) call.  The kernel assigns
@@ -129,7 +137,7 @@ svc_ioq_zc_xioq_done(struct rpc_dplx_rec *rec, struct xdr_ioq *xioq)
 	if (xioq->zc_outstanding == 0)
 		return true;
 	last = xioq->zc_cookie_lo + xioq->zc_outstanding;
-	return last <= rec->zc_acked;
+	return ZC_COOKIE_GE(rec->zc_acked, last);
 }
 
 /*
@@ -199,120 +207,182 @@ svc_ioq_zc_destroy_harvested(zc_harvest_list_t *harvest_list)
 	}
 }
 
+/* Test/set a completion bit at offset off from the base of the window. */
+static inline bool
+svc_ioq_zc_bit_test(const struct rpc_dplx_rec *rec, uint32_t off)
+{
+	return (rec->zc_ooo_bits[off >> 6] & ((uint64_t)1 << (off & 63))) != 0;
+}
+
+static inline void
+svc_ioq_zc_bit_set(struct rpc_dplx_rec *rec, uint32_t off)
+{
+	rec->zc_ooo_bits[off >> 6] |= (uint64_t)1 << (off & 63);
+}
+
 /*
- * svc_ioq_zc_absorb_ooo - merge stashed out-of-order ranges into zc_acked.
+ * svc_ioq_zc_window_slide - shift the completion window down by n cookies.
+ *
+ * Called whenever zc_acked advances by n, so that bit k keeps meaning
+ * "cookie zc_acked + k is confirmed".  Bits shifted off the bottom are
+ * cookies now below the watermark and are simply discarded.
+ *
+ * Locking: caller must hold zc_lock.
+ */
+static void
+svc_ioq_zc_window_slide(struct rpc_dplx_rec *rec, uint32_t n)
+{
+	uint32_t words = n >> 6;
+	uint32_t bits = n & 63;
+	uint32_t i;
+
+	if (words >= SVC_ZC_ACK_WORDS) {
+		/* Slid past everything we were tracking. */
+		memset(rec->zc_ooo_bits, 0, sizeof(rec->zc_ooo_bits));
+		return;
+	}
+
+	/* Writes only ever touch indices at or below the ones already read,
+	 * so a single forward pass is safe without a scratch buffer.
+	 */
+	for (i = 0; i < SVC_ZC_ACK_WORDS; i++) {
+		uint64_t v = (i + words < SVC_ZC_ACK_WORDS)
+				? rec->zc_ooo_bits[i + words] : 0;
+
+		if (bits != 0) {
+			v >>= bits;
+			if (i + words + 1 < SVC_ZC_ACK_WORDS)
+				v |= rec->zc_ooo_bits[i + words + 1] <<
+					(64 - bits);
+		}
+		rec->zc_ooo_bits[i] = v;
+	}
+}
+
+/*
+ * svc_ioq_zc_absorb_ooo - slide the watermark over confirmed cookies.
  *
  * The kernel delivers MSG_ZEROCOPY completions via the socket errqueue as
  * sock_extended_err messages carrying an inclusive [lo, hi] cookie range.
- * Under normal in-order delivery these always touch the current zc_acked
- * watermark and svc_ioq_zc_complete_locked() advances it directly.
+ * Under normal in-order delivery these touch the current zc_acked watermark
+ * and svc_ioq_zc_complete_locked() advances it directly.  On retransmission,
+ * or when a send that fell back to copy completes ahead of true ZC sends,
+ * a later range can be reported first; those land in the zc_ooo_bits window.
  *
- * On retransmission or connection teardown the kernel may report a later
- * range before an earlier one.  svc_ioq_zc_complete_locked() stashes such
- * ranges in rec->zc_ooo[].  This function is called after every watermark
- * advance to drain those stashed ranges: any range that now overlaps or
- * is contiguous with zc_acked is merged in, potentially enabling a chain
- * of further merges.  The loop repeats until no more progress is made.
- *
- * Stale entries (hi < zc_acked, already subsumed) are also evicted here to
- * keep the array small.
+ * This runs after every recorded completion and advances zc_acked over the
+ * run of confirmed cookies at the base of the window.  It stops at the first
+ * cookie that is NOT confirmed, so the watermark can never cross a gap.
  *
  * Locking: caller must hold zc_lock.
  */
 static void
 svc_ioq_zc_absorb_ooo(struct rpc_dplx_rec *rec)
 {
-	bool progressed = true;
+	uint32_t advance = 0;
 
-	while (progressed) {
-		uint8_t i;
+	/* Whole words first — an all-ones word is 64 consecutive completions,
+	 * which is the common case when the kernel batches notifications.
+	 */
+	while (advance <= SVC_ZC_ACK_WINDOW - 64 &&
+	       rec->zc_ooo_bits[advance >> 6] == ~(uint64_t)0)
+		advance += 64;
 
-		progressed = false;
-		for (i = 0; i < rec->zc_ooo_n; ) {
-			uint32_t lo = rec->zc_ooo[i].lo;
-			uint32_t hi = rec->zc_ooo[i].hi;
+	/* Then bit at a time, up to the first hole. */
+	while (advance < SVC_ZC_ACK_WINDOW && svc_ioq_zc_bit_test(rec, advance))
+		advance++;
 
-			if (hi < rec->zc_acked) {
-				rec->zc_ooo[i] = rec->zc_ooo[rec->zc_ooo_n - 1];
-				rec->zc_ooo_n--;
-				progressed = true;
-				continue;
-			}
-			if (lo <= rec->zc_acked && hi >= rec->zc_acked) {
-				rec->zc_acked = hi + 1;
-				rec->zc_ooo[i] = rec->zc_ooo[rec->zc_ooo_n - 1];
-				rec->zc_ooo_n--;
-				progressed = true;
-				continue;
-			}
-			i++;
-		}
-	}
+	if (advance == 0)
+		return;
+
+	rec->zc_acked += advance;
+	svc_ioq_zc_window_slide(rec, advance);
 }
 
 /*
- * svc_ioq_zc_complete_locked - advance zc_acked for a completed [lo, hi]
- * cookie range and harvest any zcq entries that are now fully acknowledged.
+ * svc_ioq_zc_complete_locked - record a completed [lo, hi] cookie range and
+ * harvest any zcq entries that are now fully acknowledged.
  *
  * Called from svc_ioq_zc_drain() with zc_lock already held.  Done
  * xioqs are moved into harvest_list (pointer surgery only — no XDR_DESTROY
  * under the lock).  The caller destroys them after dropping the mutex.
  *
+ * Returns the number of xioqs moved onto harvest_list, which is exactly the
+ * number of SVC_RELEASE calls the caller owes.  Do not recompute this by
+ * walking harvest_list: the list accumulates across errqueue reads, so a
+ * re-walk both costs O(n^2) and reports the running total as if it were this
+ * call's contribution.
+ *
  * Locking: caller must hold zc_lock.  Must NOT touch the mutex.
  */
-static void
+static int
 svc_ioq_zc_complete_locked(struct rpc_dplx_rec *rec, uint32_t lo, uint32_t hi,
 			    zc_harvest_list_t *harvest_list)
 {
 	SVCXPRT *xprt = &rec->xprt;
-	uint8_t i;
+	uint32_t c;
 
-	if ((int32_t)(hi - lo) < 0)
-		return;
+	/* Malformed range (hi before lo in cookie space). */
+	if (ZC_COOKIE_LT(hi, lo))
+		return 0;
 
-	if (hi < rec->zc_acked)
-		return;
+	/* Entirely below the watermark — already accounted for. */
+	if (ZC_COOKIE_LT(hi, rec->zc_acked))
+		return 0;
 
-	if (lo <= rec->zc_acked) {
-		/* Touches watermark — advance, then pull in any OOO ranges. */
-		if (hi + 1 > rec->zc_acked)
-			rec->zc_acked = hi + 1;
-		svc_ioq_zc_absorb_ooo(rec);
-	} else {
-		/* Out-of-order: stash and merge. Dropping these stalls zc_acked
-		 * forever and leaks every later zcq entry.
+	/* Clamp: cookies below the watermark are confirmed by definition. */
+	if (ZC_COOKIE_LT(lo, rec->zc_acked))
+		lo = rec->zc_acked;
+
+	if (lo == rec->zc_acked) {
+		/* In order.  The range is contiguous from the watermark, so
+		 * advancing straight to hi + 1 crosses no unconfirmed cookie
+		 * even when the kernel merged a range longer than the window.
 		 */
-		for (i = 0; i < rec->zc_ooo_n; i++) {
-			uint32_t plo = rec->zc_ooo[i].lo;
-			uint32_t phi = rec->zc_ooo[i].hi;
+		uint32_t span = hi - lo + 1;
 
-			if (lo <= phi + 1 && hi + 1 >= plo) {
-				if (lo < plo)
-					rec->zc_ooo[i].lo = lo;
-				if (hi > phi)
-					rec->zc_ooo[i].hi = hi;
-				svc_ioq_zc_absorb_ooo(rec);
-				goto reap;
+		rec->zc_acked += span;
+		svc_ioq_zc_window_slide(rec, span);
+	} else {
+		/* Out of order: record each cookie in the window.  Bounded by
+		 * SVC_ZC_ACK_WINDOW iterations since lo > zc_acked and we stop
+		 * at the window edge.
+		 */
+		for (c = lo; ; c++) {
+			uint32_t off = c - rec->zc_acked;
+
+			if (off >= SVC_ZC_ACK_WINDOW) {
+				/*
+				 * Reordered further than the window can track.
+				 * Drop the completion rather than force the
+				 * watermark past the gap: zc_acked is the only
+				 * proof svc_ioq_zc_xioq_done() has that the
+				 * kernel released an xioq's pages, so forging
+				 * it would XDR_DESTROY buffers still pinned in
+				 * the retransmit queue and put freed memory on
+				 * the wire.  Losing the completion instead only
+				 * strands the xioq on zcq until teardown.
+				 */
+				rec->zc_window_drops++;
+				__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
+					"%s: fd %d ZC completion %" PRIu32
+					" beyond ack window (acked %" PRIu32
+					", inflight %" PRIu32
+					", drops %" PRIu32 ")",
+					__func__, xprt->xp_fd, c,
+					rec->zc_acked,
+					atomic_fetch_uint32_t(
+						&rec->zc_inflight),
+					rec->zc_window_drops);
+				break;
 			}
-		}
-		if (rec->zc_ooo_n < SVC_ZC_OOO_MAX) {
-			rec->zc_ooo[rec->zc_ooo_n].lo = lo;
-			rec->zc_ooo[rec->zc_ooo_n].hi = hi;
-			rec->zc_ooo_n++;
-			svc_ioq_zc_absorb_ooo(rec);
-		} else {
-			__warnx(TIRPC_DEBUG_FLAG_WARN,
-				"%s: fd %d zc_ooo full; force acked %" PRIu32
-				" -> %" PRIu32,
-				__func__, xprt->xp_fd, rec->zc_acked, hi + 1);
-			if (hi + 1 > rec->zc_acked)
-				rec->zc_acked = hi + 1;
-			rec->zc_ooo_n = 0;
+			svc_ioq_zc_bit_set(rec, off);
+			if (c == hi)
+				break;
 		}
 	}
 
-reap:
-	svc_ioq_zc_harvest_locked(rec, harvest_list);
+	svc_ioq_zc_absorb_ooo(rec);
+	return svc_ioq_zc_harvest_locked(rec, harvest_list);
 }
 
 static bool
@@ -371,11 +441,18 @@ svc_ioq_zc_drain_collect(SVCXPRT *xprt,
 	bool copied;
 	int total = 0;
 
-	if (!__svc_params->tcp_zerocopy_enabled || !rec->zc_sock_ok)
+	if (!__svc_params->tcp_zerocopy_enabled)
+		return 0;
+
+	/* zc_sock_ok going false (SO_EE_CODE_ZEROCOPY_COPIED) only stops us
+	 * issuing *new* ZC sends.  Anything already on zcq still needs its
+	 * completions drained, so keep draining while xioqs are outstanding.
+	 */
+	if (!rec->zc_sock_ok && atomic_fetch_uint32_t(&rec->zc_inflight) == 0)
 		return 0;
 
 	for (;;) {
-		int n;
+		int n = 0;
 
 		memset(&msg, 0, sizeof(msg));
 		msg.msg_control = control;
@@ -385,7 +462,7 @@ svc_ioq_zc_drain_collect(SVCXPRT *xprt,
 			break;
 
 		if (msg.msg_flags & MSG_CTRUNC) {
-			__warnx(TIRPC_DEBUG_FLAG_WARN,
+			__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
 				"%s: fd %d MSG_CTRUNC on errqueue; cookies may be lost",
 				__func__, xprt->xp_fd);
 		}
@@ -401,30 +478,24 @@ svc_ioq_zc_drain_collect(SVCXPRT *xprt,
 			if (!svc_ioq_zc_parse_serr(cmsg, &lo, &hi, &copied))
 				continue;
 
-			svc_ioq_zc_complete_locked(rec, lo, hi, harvest_list);
+			n += svc_ioq_zc_complete_locked(rec, lo, hi,
+							harvest_list);
 
 			if (copied && rec->zc_sock_ok) {
 				rec->zc_sock_ok = false;
-				__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+				__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
 					"%s: fd %d SO_EE_CODE_ZEROCOPY_COPIED; disabling MSG_ZEROCOPY",
 					__func__, xprt->xp_fd);
 			}
 		}
 		mutex_unlock(&rec->zc_lock);
 
-		/* count this recvmsg's contribution */
-		n = 0;
-		{
-			struct poolq_entry *e;
-			TAILQ_FOREACH(e, harvest_list, q)
-				n++;
-		}
+		total += n;
 		__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
-			"%s: fd %d drain iter: reaped %d inflight %"PRIu32,
-			__func__, xprt->xp_fd,
-			n - total,
+			"%s: fd %d drain iter: reaped %d (total %d)"
+			" inflight %"PRIu32,
+			__func__, xprt->xp_fd, n, total,
 			atomic_fetch_uint32_t(&rec->zc_inflight));
-		total = n;
 	}
 	return total;
 }
@@ -464,21 +535,70 @@ svc_ioq_zc_drain(SVCXPRT *xprt)
 		svc_ioq_zc_drain_release(xprt, &harvest_list, release_count);
 }
 
+/* Teardown grace period for pages still pinned by MSG_ZEROCOPY:
+ * SVC_ZC_TEARDOWN_TRIES * SVC_ZC_TEARDOWN_NSEC (20 * 500us = 10ms).
+ */
+#define SVC_ZC_TEARDOWN_TRIES 20
+#define SVC_ZC_TEARDOWN_NSEC (500 * 1000)
+
 void
 svc_ioq_zc_release_all(SVCXPRT *xprt)
 {
 	struct rpc_dplx_rec *rec = REC_XPRT(xprt);
 	zc_harvest_list_t harvest_list;
 	struct poolq_entry *have;
+	struct timespec ts = {
+		.tv_sec = 0,
+		.tv_nsec = SVC_ZC_TEARDOWN_NSEC,
+	};
 	int release_count = 0;
+	int tries;
 
 	TAILQ_INIT(&harvest_list);
+
+	/*
+	 * Everything left on zcq is about to be XDR_DESTROYed, but our fd is
+	 * still open at this point — it is closed later, in xp_destroy — and
+	 * the kernel may still hold these pages in the retransmit queue.
+	 * Freeing them here is what puts freed memory on the wire.
+	 *
+	 * Send FIN so the peer acknowledges, then drain the errqueue for a
+	 * bounded time.  In the normal case (live peer, data already acked)
+	 * the pages come back and the frees below are clean.  Whatever is
+	 * still pinned after the grace period is freed anyway — there is
+	 * nowhere left to defer to — but that is now a logged rarity rather
+	 * than every single teardown.
+	 */
+	if (__svc_params->tcp_zerocopy_enabled &&
+	    atomic_fetch_uint32_t(&rec->zc_inflight) > 0 &&
+	    xprt->xp_fd != RPC_ANYFD) {
+		(void)shutdown(xprt->xp_fd, SHUT_WR);
+
+		for (tries = 0; tries < SVC_ZC_TEARDOWN_TRIES; tries++) {
+			svc_ioq_zc_drain(xprt);
+			if (atomic_fetch_uint32_t(&rec->zc_inflight) == 0)
+				break;
+			nanosleep(&ts, NULL);
+		}
+
+		if (atomic_fetch_uint32_t(&rec->zc_inflight) > 0) {
+			__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
+				"%s: fd %d teardown: %" PRIu32
+				" xioq(s) still pinned after grace period;"
+				" freeing before close (acked %" PRIu32
+				", next %" PRIu32 ", window drops %" PRIu32 ")",
+				__func__, xprt->xp_fd,
+				atomic_fetch_uint32_t(&rec->zc_inflight),
+				rec->zc_acked, rec->zc_next_cookie,
+				rec->zc_window_drops);
+		}
+	}
 
 	mutex_lock(&rec->zc_lock);
 	while ((have = TAILQ_FIRST(&rec->zcq)) != NULL) {
 		uint32_t _inf = atomic_dec_uint32_t(&rec->zc_inflight);
 
-		__warnx(TIRPC_DEBUG_FLAG_WARN,
+		__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
 			"%s: fd %d release_all: inflight %"PRIu32"->%"PRIu32,
 			__func__, xprt->xp_fd,
 			_inf + 1, _inf);
@@ -486,7 +606,7 @@ svc_ioq_zc_release_all(SVCXPRT *xprt)
 		TAILQ_INSERT_TAIL(&harvest_list, have, q);
 		release_count++;
 	}
-	rec->zc_ooo_n = 0;
+	memset(rec->zc_ooo_bits, 0, sizeof(rec->zc_ooo_bits));
 	mutex_unlock(&rec->zc_lock);
 
 	/* XDR_DESTROY outside the mutex. */

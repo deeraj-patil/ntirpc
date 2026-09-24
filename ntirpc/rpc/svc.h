@@ -102,7 +102,7 @@ enum xprt_stat {
 /* Package init flags that can not be updated */
 #define SVC_INIT_NO_UPDATE (SVC_INIT_XPRTS | SVC_INIT_EPOLL | \
 			    SVC_INIT_NOREG_XPRTS | SVC_INIT_BLKIN)
-			
+
 
 #define SVC_SHUTDOWN_FLAG_NONE  0x0000
 
@@ -157,8 +157,8 @@ typedef struct svc_init_params {
 	uint32_t max_rdma_connections;	/* dynamic */
 
 	/* TCP zerocopy parameters (Linux MSG_ZEROCOPY) */
-	bool tcp_zerocopy_enabled;	/* enable/disable TCP MSG_ZEROCOPY */
-	uint32_t tcp_zerocopy_min_bytes; /* minimum send size for ZC in bytes */
+	bool tcp_zerocopy_enabled;	/* enable/disable TCP MSG_ZEROCOPY, non-dynamic */
+	uint32_t tcp_zerocopy_min_bytes; /* minimum send size for ZC in bytes, dynamic */
 } svc_init_params;
 
 /* Svc param flags */

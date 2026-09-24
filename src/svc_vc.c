@@ -543,12 +543,13 @@ svc_vc_rendezvous(SVCXPRT *xprt)
 	 */
 	len = 1;
 	if (setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &len, sizeof(len)) != 0) {
-		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
-			"%s: fd %d SO_ZEROCOPY failed (%d)", __func__, fd,
-			errno);
+		__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
+			"fd %d SO_ZEROCOPY failed (%d)", __func__, fd, errno);
 		REC_XPRT(newxprt)->zc_sock_ok = false;
 	} else {
 		REC_XPRT(newxprt)->zc_sock_ok = true;
+		__warnx(TIRPC_DEBUG_FLAG_ZEROCOPY_TX,
+				"fd %d SO_ZEROCOPY enabled", fd);
 	}
 #endif
 

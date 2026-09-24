@@ -27,6 +27,7 @@
 #ifndef RPC_DPLX_INTERNAL_H
 #define RPC_DPLX_INTERNAL_H
 
+#include <string.h>
 #include <misc/queue.h>
 #include <misc/rbtree.h>
 #include <misc/wait_queue.h>
@@ -59,14 +60,22 @@ struct rpc_dplx_rec {
 	struct poolq_head writeq;	/**< poolq for write requests */
 	/*
 	 * xioqs whose bytes are in the kernel but still pinned for
-	 * MSG_ZEROCOPY. Protected by writeq.qmutex. zc_next_cookie matches
-	 * the per-socket counter the kernel assigns on each successful
-	 * MSG_ZEROCOPY sendmsg.
+	 * MSG_ZEROCOPY. zc_next_cookie matches the per-socket counter the
+	 * kernel assigns on each successful MSG_ZEROCOPY sendmsg.
 	 *
-	 * Completions may arrive out of order (retransmission / teardown).
-	 * zc_ooo holds inclusive [lo,hi] cookie ranges that completed ahead
-	 * of zc_acked so the watermark can still advance — dropping those
-	 * caused unbounded zcq growth (memory leak).
+	 * Completions may arrive out of order (retransmission, or a send that
+	 * fell back to copy completing ahead of true ZC sends).  zc_acked is
+	 * the watermark: every cookie below it is confirmed unpinned, and it
+	 * is the *only* evidence svc_ioq_zc_xioq_done() has that the kernel
+	 * has let go of an xioq's pages.  It must therefore never be advanced
+	 * across a cookie we have not seen confirmed — doing so frees pages
+	 * still sitting in the TCP retransmit queue.
+	 *
+	 * Completions that arrive ahead of the watermark are recorded in
+	 * zc_ooo_bits, a bitmap of the SVC_ZC_ACK_WINDOW cookies starting at
+	 * zc_acked (bit k == cookie zc_acked + k).  It slides as zc_acked
+	 * advances, absorbs arbitrary reordering within the window, and
+	 * cannot fragment the way a fixed array of [lo,hi] ranges did.
 	 *
 	 * zcq uses a plain TAILQ rather than poolq_head because the
 	 * poolq_head mutex and qsize fields are not needed here.
@@ -78,12 +87,10 @@ struct rpc_dplx_rec {
 	uint32_t zc_inflight;		/* xioqs on zcq waiting for kernel ACK; atomic */
 	uint32_t zc_next_cookie;	/* next cookie to assign on ZC sendmsg */
 	uint32_t zc_acked;		/* all cookies < this are completed */
-#define SVC_ZC_OOO_MAX 8	/* kernel reorder depth is typically ≤ 4 */
-	struct {
-		uint32_t lo;
-		uint32_t hi;
-	} zc_ooo[SVC_ZC_OOO_MAX];
-	uint8_t zc_ooo_n;
+#define SVC_ZC_ACK_WINDOW 256	/* cookies trackable ahead of zc_acked */
+#define SVC_ZC_ACK_WORDS (SVC_ZC_ACK_WINDOW / 64)
+	uint64_t zc_ooo_bits[SVC_ZC_ACK_WORDS];
+	uint32_t zc_window_drops;	/* completions lost past the window */
 	bool zc_sock_ok;		/* SO_ZEROCOPY succeeded on this fd */
 	struct opr_rbtree call_replies;
 	struct opr_rbtree rdma_call_expires;	/**< call expiration tree for RDMA */
@@ -163,7 +170,8 @@ rpc_dplx_rec_init(struct rpc_dplx_rec *rec)
 	rec->zc_inflight = 0;
 	rec->zc_next_cookie = 0;
 	rec->zc_acked = 0;
-	rec->zc_ooo_n = 0;
+	memset(rec->zc_ooo_bits, 0, sizeof(rec->zc_ooo_bits));
+	rec->zc_window_drops = 0;
 	rec->zc_sock_ok = false;
 	/* Stop this xprt being cleaned immediately */
 	(void)clock_gettime(CLOCK_MONOTONIC_FAST, &(rec->recv.ts));

@@ -158,7 +158,9 @@ svc_init(svc_init_params *params)
 		    original.gss_ctx_hash_partitions !=
 			params->gss_ctx_hash_partitions ||
 		    original.channels != params->channels ||
-		    original.thr_stack_size != params->thr_stack_size) {
+		    original.thr_stack_size != params->thr_stack_size ||
+		    original.tcp_zerocopy_enabled !=
+				params->tcp_zerocopy_enabled) {
 			__warnx(TIRPC_DEBUG_FLAG_WARN,
 				"%s: attempt to change non-updateable svc param",
 				__func__);
@@ -271,7 +273,8 @@ svc_init(svc_init_params *params)
 /* TCP zerocopy parameters (Linux MSG_ZEROCOPY) */
 #if defined(HAVE_TCP_ZEROCOPY) || (defined(__linux__) && defined(MSG_ZEROCOPY) && defined(SO_ZEROCOPY))
 	if (!update) {
-		__svc_params->tcp_zerocopy_enabled = params->tcp_zerocopy_enabled;
+		__svc_params->tcp_zerocopy_enabled =
+			params->tcp_zerocopy_enabled;
 	}
 	{
 		uint32_t min_bytes = (params->tcp_zerocopy_min_bytes > 0)
